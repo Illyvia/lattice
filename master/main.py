@@ -250,6 +250,14 @@ def _json_error(status_code: int, message: str) -> tuple[dict[str, Any], int]:
     return {"error": message}, status_code
 
 
+def _is_ws_receive_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    name = exc.__class__.__name__.lower()
+    details = str(exc).lower()
+    return "timeout" in name or "timed out" in details
+
+
 def _coerce_vm_limit(raw_value: str | None, default: int = 50) -> int:
     try:
         if raw_value is None:
@@ -989,8 +997,10 @@ def ws_node_terminal(ws, node_id: str):
 
             try:
                 raw = ws.receive(timeout=0.2)
-            except TimeoutError:
-                continue
+            except Exception as exc:
+                if _is_ws_receive_timeout(exc):
+                    continue
+                raise
             if raw is None:
                 # simple-websocket returns None on timeout when no frame is available.
                 # Treat this as idle and keep the session open.
@@ -1153,8 +1163,10 @@ def ws_vm_terminal(ws, node_id: str, vm_id: str):
 
             try:
                 raw = ws.receive(timeout=0.2)
-            except TimeoutError:
-                continue
+            except Exception as exc:
+                if _is_ws_receive_timeout(exc):
+                    continue
+                raise
             if raw is None:
                 # simple-websocket returns None on timeout when no frame is available.
                 # Treat this as idle and keep the session open.
@@ -1254,8 +1266,10 @@ def ws_agent(ws):
                     send_message(outbound)
             try:
                 raw = ws.receive(timeout=0.1)
-            except TimeoutError:
-                continue
+            except Exception as exc:
+                if _is_ws_receive_timeout(exc):
+                    continue
+                raise
             if raw is None:
                 # simple-websocket returns None on timeout when idle.
                 continue
