@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from agent.config import AgentConfig, load_config
 from agent.heartbeat import HeartbeatSender
+from agent.vm_libvirt import execute_vm_command, get_vm_capability
 from agent.ws_stream import AgentWebSocketStreamer
 from log_setup import setup_logger
 from agent.system import get_runtime_metrics, get_system_info, log_system_info
@@ -145,6 +146,7 @@ def build_heartbeat_extra() -> dict[str, Any]:
         "arch": info["arch"],
         "hardware": info["hardware"],
         "usage": get_runtime_metrics(),
+        "vm": get_vm_capability(max_age_seconds=60),
     }
     git_commit = get_git_commit_hash()
     if git_commit:
@@ -291,6 +293,7 @@ def main() -> None:
     ws_streamer: AgentWebSocketStreamer | None = None
     ws_log_handler: WebSocketLogHandler | None = None
     update_in_progress = threading.Event()
+    vm_command_in_progress = threading.Event()
 
     def handle_ws_command(command: dict[str, Any]) -> None:
         nonlocal ws_streamer
@@ -299,56 +302,111 @@ def main() -> None:
             return
 
         command_type = command.get("command_type")
+        operation_id_raw = command.get("operation_id")
+        operation_id = (
+            operation_id_raw.strip()
+            if isinstance(operation_id_raw, str) and operation_id_raw.strip()
+            else None
+        )
+        vm_id_raw = command.get("vm_id")
+        vm_id = vm_id_raw.strip() if isinstance(vm_id_raw, str) and vm_id_raw.strip() else None
         command_id = command.get("command_id")
         if not isinstance(command_id, str) or not command_id.strip():
             command_id = "unknown"
 
-        if command_type != "update_agent":
-            log.info(f"Ignoring unsupported command type={command_type}")
-            if ws_streamer:
-                ws_streamer.send_command_result(
-                    command_id=command_id,
-                    command_type=str(command_type),
-                    status="failed",
-                    message=f"Unsupported command type: {command_type}",
+        if command_type == "update_agent":
+            if update_in_progress.is_set():
+                message = "Update already in progress"
+                log.info(message)
+                if ws_streamer:
+                    ws_streamer.send_command_result(
+                        command_id=command_id,
+                        command_type="update_agent",
+                        status="busy",
+                        message=message,
+                    )
+                return
+
+            update_in_progress.set()
+            try:
+                force = bool(command.get("force", False))
+                branch = command.get("branch") if isinstance(command.get("branch"), str) else None
+                log.info(
+                    f"Received update command command_id={command_id} force={force} branch={branch or 'upstream'}"
                 )
+                status, message, details = execute_agent_update(force=force, branch=branch)
+                if status == "failed":
+                    log.info(f"Agent update failed command_id={command_id} details={details}")
+                else:
+                    log.info(f"Agent update {status} command_id={command_id} details={details}")
+
+                if ws_streamer:
+                    ws_streamer.send_command_result(
+                        command_id=command_id,
+                        command_type="update_agent",
+                        status=status,
+                        message=message,
+                        details=details,
+                    )
+            finally:
+                update_in_progress.clear()
             return
 
-        if update_in_progress.is_set():
-            message = "Update already in progress"
-            log.info(message)
-            if ws_streamer:
-                ws_streamer.send_command_result(
-                    command_id=command_id,
-                    command_type="update_agent",
-                    status="busy",
-                    message=message,
-                )
+        if isinstance(command_type, str) and command_type.startswith("vm_"):
+            if vm_command_in_progress.is_set():
+                message = "Another VM command is already in progress"
+                log.info(f"{message} command_id={command_id}")
+                if ws_streamer:
+                    ws_streamer.send_command_result(
+                        command_id=command_id,
+                        operation_id=operation_id,
+                        vm_id=vm_id,
+                        command_type=command_type,
+                        status="busy",
+                        message=message,
+                    )
+                return
+
+            vm_command_in_progress.set()
+            try:
+                log.info(f"Received VM command command_id={command_id} type={command_type} vm_id={vm_id}")
+                if ws_streamer:
+                    ws_streamer.send_command_result(
+                        command_id=command_id,
+                        operation_id=operation_id,
+                        vm_id=vm_id,
+                        command_type=command_type,
+                        status="running",
+                        message=f"{command_type} started",
+                    )
+
+                status, message, details = execute_vm_command(command)
+                level = "error" if status != "succeeded" else "info"
+                log.log(logging.ERROR if level == "error" else logging.INFO, f"VM command {command_type} -> {status}: {message}")
+                if ws_streamer:
+                    ws_streamer.send_command_result(
+                        command_id=command_id,
+                        operation_id=operation_id,
+                        vm_id=vm_id,
+                        command_type=command_type,
+                        status=status,
+                        message=message,
+                        details=details,
+                    )
+            finally:
+                vm_command_in_progress.clear()
             return
 
-        update_in_progress.set()
-        try:
-            force = bool(command.get("force", False))
-            branch = command.get("branch") if isinstance(command.get("branch"), str) else None
-            log.info(
-                f"Received update command command_id={command_id} force={force} branch={branch or 'upstream'}"
+        log.info(f"Ignoring unsupported command type={command_type}")
+        if ws_streamer:
+            ws_streamer.send_command_result(
+                command_id=command_id,
+                operation_id=operation_id,
+                vm_id=vm_id,
+                command_type=str(command_type),
+                status="failed",
+                message=f"Unsupported command type: {command_type}",
             )
-            status, message, details = execute_agent_update(force=force, branch=branch)
-            if status == "failed":
-                log.info(f"Agent update failed command_id={command_id} details={details}")
-            else:
-                log.info(f"Agent update {status} command_id={command_id} details={details}")
-
-            if ws_streamer:
-                ws_streamer.send_command_result(
-                    command_id=command_id,
-                    command_type="update_agent",
-                    status=status,
-                    message=message,
-                    details=details,
-                )
-        finally:
-            update_in_progress.clear()
 
     def start_ws_streamer(current_state: dict[str, str]) -> None:
         nonlocal ws_streamer, ws_log_handler

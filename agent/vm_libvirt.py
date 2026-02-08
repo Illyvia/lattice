@@ -1,0 +1,331 @@
+import hashlib
+import platform
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+from urllib import request
+
+
+VM_ROOT = Path("/var/lib/lattice/vms")
+IMAGE_ROOT = Path("/var/lib/lattice/vm-images")
+_IPV4_REGEX = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+_CAPABILITY_LOCK = threading.Lock()
+_CAPABILITY_CACHE: dict[str, Any] = {"checked_at": 0.0, "value": None}
+
+
+def _run(cmd: list[str], timeout_seconds: int = 120) -> tuple[int, str, str]:
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+        return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def _run_sudo(cmd: list[str], timeout_seconds: int = 120) -> tuple[int, str, str]:
+    return _run(["sudo", "-n", *cmd], timeout_seconds=timeout_seconds)
+
+
+def _compute_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest().lower()
+
+
+def _domain_state(domain_name: str) -> str:
+    rc, stdout, _ = _run_sudo(["virsh", "domstate", domain_name], timeout_seconds=30)
+    if rc != 0:
+        return "unknown"
+    return stdout.strip().lower()
+
+
+def _domain_uuid(domain_name: str) -> str | None:
+    rc, stdout, _ = _run_sudo(["virsh", "domuuid", domain_name], timeout_seconds=30)
+    if rc != 0:
+        return None
+    value = stdout.strip()
+    return value or None
+
+
+def _domain_ip(domain_name: str) -> str | None:
+    rc, stdout, _ = _run_sudo(["virsh", "domifaddr", domain_name, "--source", "agent"], timeout_seconds=30)
+    if rc != 0:
+        return None
+    for line in stdout.splitlines():
+        match = _IPV4_REGEX.search(line)
+        if match:
+            return match.group(0)
+    return None
+
+
+def _detect_capability() -> dict[str, Any]:
+    if platform.system().lower() != "linux":
+        return {
+            "provider": "libvirt",
+            "ready": False,
+            "message": "libvirt VM support is Linux-only in v1",
+            "missing_tools": [],
+            "managed_paths": [str(IMAGE_ROOT), str(VM_ROOT)],
+        }
+
+    required_tools = ["sudo", "virsh", "virt-install", "qemu-img", "cloud-localds", "install", "mkdir", "rm"]
+    missing_tools = [tool for tool in required_tools if shutil.which(tool) is None]
+    if missing_tools:
+        return {
+            "provider": "libvirt",
+            "ready": False,
+            "message": "Missing required virtualization tools",
+            "missing_tools": missing_tools,
+            "managed_paths": [str(IMAGE_ROOT), str(VM_ROOT)],
+        }
+
+    rc, _stdout, stderr = _run_sudo(["virsh", "list", "--all"], timeout_seconds=30)
+    if rc != 0:
+        return {
+            "provider": "libvirt",
+            "ready": False,
+            "message": "Unable to access libvirt with sudo -n",
+            "missing_tools": [],
+            "managed_paths": [str(IMAGE_ROOT), str(VM_ROOT)],
+            "details": stderr,
+        }
+
+    return {
+        "provider": "libvirt",
+        "ready": True,
+        "message": "libvirt ready",
+        "missing_tools": [],
+        "managed_paths": [str(IMAGE_ROOT), str(VM_ROOT)],
+    }
+
+
+def get_vm_capability(max_age_seconds: int = 60) -> dict[str, Any]:
+    with _CAPABILITY_LOCK:
+        now = time.monotonic()
+        checked_at = float(_CAPABILITY_CACHE["checked_at"])
+        cached = _CAPABILITY_CACHE["value"]
+        if cached is not None and now - checked_at <= max(1, max_age_seconds):
+            return dict(cached)
+
+        fresh = _detect_capability()
+        _CAPABILITY_CACHE["checked_at"] = now
+        _CAPABILITY_CACHE["value"] = fresh
+        return dict(fresh)
+
+
+def _download_cloud_image(image: dict[str, Any]) -> tuple[str, Path | None]:
+    image_id = str(image.get("id", "")).strip()
+    image_url = str(image.get("source_url", "")).strip()
+    expected_sha = image.get("sha256")
+
+    if not image_id:
+        return "image.id is required", None
+    if not image_url:
+        return "image.source_url is required", None
+
+    image_path = IMAGE_ROOT / f"{image_id}.qcow2"
+    tmp_path = Path(tempfile.gettempdir()) / f"lattice-image-{image_id}.tmp"
+
+    rc, _, err = _run_sudo(["mkdir", "-p", str(IMAGE_ROOT)], timeout_seconds=30)
+    if rc != 0:
+        return f"unable to prepare image directory: {err}", None
+
+    if not image_path.exists():
+        request.urlretrieve(image_url, tmp_path)
+        if isinstance(expected_sha, str) and expected_sha.strip():
+            digest = _compute_sha256(tmp_path)
+            if digest != expected_sha.strip().lower():
+                tmp_path.unlink(missing_ok=True)
+                return "image checksum mismatch", None
+        rc, _, err = _run_sudo(["install", "-m", "0644", str(tmp_path), str(image_path)], timeout_seconds=120)
+        tmp_path.unlink(missing_ok=True)
+        if rc != 0:
+            return f"unable to install image: {err}", None
+
+    return "", image_path
+
+
+def _create_cloud_init_seed(vm_dir: Path, domain_name: str, username: str, password: str) -> tuple[str, Path | None]:
+    user_data_path = Path(tempfile.gettempdir()) / f"{domain_name}-user-data.yaml"
+    meta_data_path = Path(tempfile.gettempdir()) / f"{domain_name}-meta-data.yaml"
+    seed_path = vm_dir / "seed.iso"
+    user_data = (
+        "#cloud-config\n"
+        f"hostname: {domain_name}\n"
+        "manage_etc_hosts: true\n"
+        "users:\n"
+        f"  - name: {username}\n"
+        "    shell: /bin/bash\n"
+        "    groups: sudo\n"
+        "    sudo: ALL=(ALL) NOPASSWD:ALL\n"
+        "    lock_passwd: false\n"
+        f"    plain_text_passwd: '{password}'\n"
+        "ssh_pwauth: true\n"
+        "chpasswd:\n"
+        "  expire: false\n"
+    )
+    meta_data = f"instance-id: {domain_name}\nlocal-hostname: {domain_name}\n"
+    user_data_path.write_text(user_data, encoding="utf-8")
+    meta_data_path.write_text(meta_data, encoding="utf-8")
+    try:
+        rc, _, err = _run_sudo(["cloud-localds", str(seed_path), str(user_data_path), str(meta_data_path)], timeout_seconds=120)
+        if rc != 0:
+            return f"cloud-init seed creation failed: {err}", None
+        return "", seed_path
+    finally:
+        user_data_path.unlink(missing_ok=True)
+        meta_data_path.unlink(missing_ok=True)
+
+
+def _create_vm(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    vm_id = str(spec.get("vm_id", "")).strip()
+    domain_name = str(spec.get("domain_name", "")).strip()
+    image = spec.get("image")
+    guest = spec.get("guest")
+    if not vm_id or not domain_name or not isinstance(image, dict) or not isinstance(guest, dict):
+        return "failed", "Invalid vm_create payload", {}
+
+    vcpu = int(spec.get("vcpu", 1))
+    memory_mb = int(spec.get("memory_mb", 1024))
+    disk_gb = int(spec.get("disk_gb", 20))
+    bridge = str(spec.get("bridge", "br0")).strip() or "br0"
+    guest_username = str(guest.get("username", "")).strip()
+    guest_password = str(guest.get("password", "")).strip()
+    if not guest_username or not guest_password:
+        return "failed", "Guest credentials are required", {}
+
+    vm_dir = VM_ROOT / vm_id
+    disk_path = vm_dir / "disk.qcow2"
+    rc, _, err = _run_sudo(["mkdir", "-p", str(vm_dir)], timeout_seconds=30)
+    if rc != 0:
+        return "failed", f"Unable to create VM directory: {err}", {}
+
+    image_error, base_image_path = _download_cloud_image(image)
+    if image_error or base_image_path is None:
+        return "failed", image_error or "Failed to resolve VM image", {}
+
+    rc, _, err = _run_sudo(
+        ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base_image_path), str(disk_path), f"{disk_gb}G"],
+        timeout_seconds=240,
+    )
+    if rc != 0:
+        return "failed", f"Disk provisioning failed: {err}", {}
+
+    seed_error, seed_path = _create_cloud_init_seed(vm_dir, domain_name, guest_username, guest_password)
+    if seed_error or seed_path is None:
+        return "failed", seed_error or "Cloud-init seed error", {}
+
+    virt_cmd = [
+        "virt-install",
+        "--name",
+        domain_name,
+        "--memory",
+        str(memory_mb),
+        "--vcpus",
+        str(vcpu),
+        "--import",
+        "--disk",
+        f"path={disk_path},format=qcow2,bus=virtio",
+        "--disk",
+        f"path={seed_path},device=cdrom",
+        "--network",
+        f"bridge={bridge},model=virtio",
+        "--graphics",
+        "none",
+        "--noautoconsole",
+    ]
+    rc, _stdout, err = _run_sudo(virt_cmd, timeout_seconds=300)
+    if rc != 0:
+        return "failed", f"virt-install failed: {err}", {}
+
+    return "succeeded", "VM created", {
+        "vm_id": vm_id,
+        "domain_name": domain_name,
+        "domain_uuid": _domain_uuid(domain_name),
+        "power_state": _domain_state(domain_name),
+        "ip_address": _domain_ip(domain_name),
+    }
+
+
+def execute_vm_command(command: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    try:
+        capability = get_vm_capability()
+        if not capability.get("ready"):
+            return "failed", str(capability.get("message", "VM capability is not ready")), {"capability": capability}
+
+        command_type = str(command.get("command_type", "")).strip()
+        vm_id = str(command.get("vm_id", "")).strip()
+        domain_name = str(command.get("domain_name", "")).strip()
+        if command_type == "vm_create":
+            spec = command.get("spec")
+            if not isinstance(spec, dict):
+                return "failed", "Missing create spec", {}
+            return _create_vm(spec)
+
+        if not domain_name:
+            vm_spec = command.get("vm_spec")
+            if isinstance(vm_spec, dict):
+                domain_name = str(vm_spec.get("domain_name", "")).strip()
+        if not domain_name:
+            return "failed", "domain_name is required", {}
+
+        if command_type == "vm_start":
+            rc, _, err = _run_sudo(["virsh", "start", domain_name], timeout_seconds=60)
+            if rc != 0 and "already active" not in err.lower():
+                return "failed", f"Unable to start VM: {err}", {}
+            return "succeeded", "VM started", {"vm_id": vm_id, "domain_name": domain_name, "power_state": _domain_state(domain_name), "domain_uuid": _domain_uuid(domain_name), "ip_address": _domain_ip(domain_name)}
+
+        if command_type == "vm_stop":
+            _run_sudo(["virsh", "shutdown", domain_name], timeout_seconds=30)
+            for _ in range(12):
+                state = _domain_state(domain_name)
+                if "shut" in state or "off" in state or "stopped" in state:
+                    return "succeeded", "VM stopped", {"vm_id": vm_id, "domain_name": domain_name, "power_state": "stopped", "domain_uuid": _domain_uuid(domain_name)}
+                time.sleep(2)
+            _run_sudo(["virsh", "destroy", domain_name], timeout_seconds=30)
+            state = _domain_state(domain_name)
+            if "running" in state:
+                return "failed", "VM did not stop", {"vm_id": vm_id, "domain_name": domain_name, "power_state": state}
+            return "succeeded", "VM stopped", {"vm_id": vm_id, "domain_name": domain_name, "power_state": state, "domain_uuid": _domain_uuid(domain_name)}
+
+        if command_type == "vm_reboot":
+            rc, _, err = _run_sudo(["virsh", "reboot", domain_name], timeout_seconds=60)
+            if rc != 0:
+                return "failed", f"Unable to reboot VM: {err}", {}
+            return "succeeded", "VM rebooted", {"vm_id": vm_id, "domain_name": domain_name, "power_state": _domain_state(domain_name), "domain_uuid": _domain_uuid(domain_name), "ip_address": _domain_ip(domain_name)}
+
+        if command_type == "vm_delete":
+            _run_sudo(["virsh", "destroy", domain_name], timeout_seconds=30)
+            rc, stdout, err = _run_sudo(["virsh", "undefine", domain_name, "--nvram", "--remove-all-storage"], timeout_seconds=120)
+            if rc != 0 and "domain not found" not in f"{stdout} {err}".lower():
+                return "failed", f"Unable to delete VM: {err or stdout}", {}
+            if vm_id:
+                _run_sudo(["rm", "-rf", str(VM_ROOT / vm_id)], timeout_seconds=30)
+            return "succeeded", "VM deleted", {"vm_id": vm_id, "domain_name": domain_name, "power_state": "deleted"}
+
+        if command_type == "vm_sync":
+            rc, stdout, err = _run_sudo(["virsh", "list", "--all", "--name"], timeout_seconds=30)
+            if rc != 0:
+                return "failed", f"Unable to sync VM state: {err}", {}
+            names = [line.strip() for line in stdout.splitlines() if line.strip()]
+            vms = [{"domain_name": name, "power_state": _domain_state(name), "domain_uuid": _domain_uuid(name)} for name in names]
+            return "succeeded", "VM sync complete", {"vms": vms}
+
+        return "failed", f"Unsupported vm command type: {command_type}", {}
+    except Exception as exc:
+        return "failed", f"VM command exception: {exc}", {}

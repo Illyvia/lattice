@@ -77,6 +77,8 @@ class AgentWebSocketStreamer:
         status: str,
         message: str,
         details: dict | None = None,
+        operation_id: str | None = None,
+        vm_id: str | None = None,
     ) -> None:
         event: dict = {
             "type": "command_result",
@@ -87,6 +89,10 @@ class AgentWebSocketStreamer:
         }
         if isinstance(details, dict) and details:
             event["details"] = details
+        if isinstance(operation_id, str) and operation_id.strip():
+            event["operation_id"] = operation_id.strip()
+        if isinstance(vm_id, str) and vm_id.strip():
+            event["vm_id"] = vm_id.strip()
         self._enqueue(event)
 
     def _enqueue(self, event: dict) -> None:

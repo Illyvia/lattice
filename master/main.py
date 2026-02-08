@@ -21,14 +21,23 @@ if str(ROOT_DIR) not in sys.path:
 from agent.system import log_system_info
 from log_setup import setup_logger
 from master.db import (
+    apply_vm_command_result,
     append_node_log,
     create_node,
+    create_vm_request,
     delete_node,
+    fail_stale_vm_operations,
+    fail_unfinished_vm_operations,
+    get_node_vm,
     init_db,
     is_valid_node_token,
+    list_node_vms,
+    list_vm_images,
+    list_vm_operations,
     list_node_logs,
     list_nodes,
     pair_node,
+    queue_vm_action,
     rename_node,
     record_heartbeat,
 )
@@ -59,6 +68,12 @@ log.info("Lattice master started")
 log_system_info(log)
 
 init_db(DB_PATH)
+failed_after_restart = fail_unfinished_vm_operations(
+    DB_PATH,
+    reason="Master restarted before operation dispatch",
+)
+if failed_after_restart > 0:
+    log.info(f"Marked {failed_after_restart} stale VM operations as failed after restart")
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -128,6 +143,16 @@ def _json_error(status_code: int, message: str) -> tuple[dict[str, Any], int]:
     return {"error": message}, status_code
 
 
+def _coerce_vm_limit(raw_value: str | None, default: int = 50) -> int:
+    try:
+        if raw_value is None:
+            raise ValueError
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = default
+    return max(1, min(value, 200))
+
+
 def _resolve_logs_request(node_id: str) -> tuple[dict[str, Any], int]:
     limit_raw = request.args.get("limit", "200")
     since_id_raw = request.args.get("since_id")
@@ -170,7 +195,137 @@ def health():
 
 @app.get("/api/nodes")
 def get_nodes():
+    fail_stale_vm_operations(DB_PATH)
     return jsonify(list_nodes(DB_PATH)), 200
+
+
+@app.get("/api/vm-images")
+def get_vm_images():
+    return jsonify(list_vm_images(DB_PATH)), 200
+
+
+@app.get("/api/nodes/<node_id>/vms")
+def get_node_vms(node_id: str):
+    fail_stale_vm_operations(DB_PATH)
+    status, vms = list_node_vms(DB_PATH, node_id=node_id)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    return jsonify(vms), 200
+
+
+@app.get("/api/nodes/<node_id>/vms/<vm_id>")
+def get_node_vm_route(node_id: str, vm_id: str):
+    status, vm = get_node_vm(DB_PATH, node_id=node_id, vm_id=vm_id)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "vm_not_found":
+        return _json_error(404, "vm not found")
+    return jsonify(vm), 200
+
+
+@app.get("/api/nodes/<node_id>/vms/<vm_id>/operations")
+def get_node_vm_operations(node_id: str, vm_id: str):
+    limit = _coerce_vm_limit(request.args.get("limit"))
+    status, operations = list_vm_operations(
+        DB_PATH,
+        node_id=node_id,
+        vm_id=vm_id,
+        limit=limit,
+    )
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "vm_not_found":
+        return _json_error(404, "vm not found")
+    return jsonify(operations), 200
+
+
+@app.post("/api/nodes/<node_id>/vms")
+def post_node_vm(node_id: str):
+    payload = request.get_json(silent=True) or {}
+    status, result = create_vm_request(DB_PATH, node_id=node_id, payload=payload)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "node_not_paired":
+        return _json_error(409, "node must be paired before creating vms")
+    if status == "capability_not_ready":
+        return _json_error(409, "node vm capability is not ready")
+    if status == "image_not_found":
+        return _json_error(404, "vm image not found")
+    if status == "invalid_payload":
+        return _json_error(400, str(result.get("error")) if isinstance(result, dict) else "invalid payload")
+    if status == "conflict":
+        return _json_error(409, str(result.get("error")) if isinstance(result, dict) else "vm conflict")
+
+    command = result["command"]
+    _enqueue_agent_command(node_id, command)
+    connected = _is_agent_connected(node_id)
+    operation_id = command.get("operation_id")
+    vm_id = command.get("vm_id")
+    log.info(
+        f"Queued vm_create node_id={node_id} operation_id={operation_id} vm_id={vm_id} connected={connected}"
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "queued": True,
+            "agent_connected": connected,
+            "vm": result["vm"],
+            "operation": result["operation"],
+        }
+    ), 202
+
+
+def _queue_vm_action_route(node_id: str, vm_id: str, action: str):
+    status, result = queue_vm_action(DB_PATH, node_id=node_id, vm_id=vm_id, action=action)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "vm_not_found":
+        return _json_error(404, "vm not found")
+    if status == "node_not_paired":
+        return _json_error(409, "node must be paired before vm actions")
+    if status == "capability_not_ready":
+        return _json_error(409, "node vm capability is not ready")
+    if status == "invalid_state":
+        return _json_error(409, str(result.get("error")) if isinstance(result, dict) else "invalid vm state")
+    if status == "invalid_action":
+        return _json_error(400, "invalid action")
+
+    command = result["command"]
+    _enqueue_agent_command(node_id, command)
+    connected = _is_agent_connected(node_id)
+    operation_id = command.get("operation_id")
+    log.info(
+        f"Queued vm_{action} node_id={node_id} vm_id={vm_id} operation_id={operation_id} connected={connected}"
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "queued": True,
+            "agent_connected": connected,
+            "vm": result["vm"],
+            "operation": result["operation"],
+        }
+    ), 202
+
+
+@app.post("/api/nodes/<node_id>/vms/<vm_id>/actions/start")
+def post_node_vm_start(node_id: str, vm_id: str):
+    return _queue_vm_action_route(node_id=node_id, vm_id=vm_id, action="start")
+
+
+@app.post("/api/nodes/<node_id>/vms/<vm_id>/actions/stop")
+def post_node_vm_stop(node_id: str, vm_id: str):
+    return _queue_vm_action_route(node_id=node_id, vm_id=vm_id, action="stop")
+
+
+@app.post("/api/nodes/<node_id>/vms/<vm_id>/actions/reboot")
+def post_node_vm_reboot(node_id: str, vm_id: str):
+    return _queue_vm_action_route(node_id=node_id, vm_id=vm_id, action="reboot")
+
+
+@app.post("/api/nodes/<node_id>/vms/<vm_id>/actions/delete")
+def post_node_vm_delete(node_id: str, vm_id: str):
+    return _queue_vm_action_route(node_id=node_id, vm_id=vm_id, action="delete")
 
 
 @app.get("/api/nodes/<node_id>/logs")
@@ -545,6 +700,7 @@ def ws_agent(ws):
 
             if message_type == "command_result":
                 command_id = payload.get("command_id")
+                operation_id = payload.get("operation_id")
                 command_type = payload.get("command_type")
                 status = payload.get("status")
                 message = payload.get("message")
@@ -561,6 +717,25 @@ def ws_agent(ws):
                     message = "No details provided"
                 if not isinstance(details, dict):
                     details = None
+
+                vm_operation_id = operation_id if isinstance(operation_id, str) and operation_id.strip() else command_id
+                if isinstance(command_type, str) and command_type.startswith("vm_"):
+                    apply_status, _ = apply_vm_command_result(
+                        DB_PATH,
+                        node_id=node_id or "",
+                        operation_id=vm_operation_id,
+                        command_type=command_type,
+                        status=status,
+                        message=message,
+                        details=details,
+                    )
+                    if apply_status == "not_found":
+                        send_message({"type": "error", "error": "operation_not_found"})
+                    log.info(
+                        f"Agent vm command result node_id={node_id} operation_id={vm_operation_id} "
+                        f"type={command_type} status={status} message={message}"
+                    )
+                    continue
 
                 level = "info"
                 if status in {"failed", "error"}:

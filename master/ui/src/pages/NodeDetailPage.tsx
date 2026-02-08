@@ -4,12 +4,14 @@ import type { IconProp } from "@fortawesome/fontawesome-svg-core";
 import {
   faArrowLeft,
   faArrowsRotate,
+  faPlus,
   faPenToSquare,
   faRotateRight,
   faTrashCan
 } from "@fortawesome/free-solid-svg-icons";
 import { faApple, faLinux, faWindows } from "@fortawesome/free-brands-svg-icons";
 import { useNavigate, useParams } from "react-router-dom";
+import NodeVmsPanel from "../components/NodeVmsPanel";
 import { NodeLogRecord, NodeRecord, RuntimeMetrics } from "../types";
 import { formatTimestamp, getHeartbeatHealth } from "../utils/health";
 import { toast } from "react-toastify";
@@ -200,6 +202,8 @@ export default function NodeDetailPage({
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"main" | "stats" | "vms">("main");
+  const [openCreateVmIntent, setOpenCreateVmIntent] = useState(0);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
   const nodeLogsWsUrl = useMemo(() => {
@@ -224,6 +228,7 @@ export default function NodeDetailPage({
   useEffect(() => {
     setUsePolling(false);
     setStreamConnected(false);
+    setActiveTab("main");
   }, [node?.id]);
 
   useEffect(() => {
@@ -490,6 +495,28 @@ export default function NodeDetailPage({
   const storageUsedBytes = asNumber(metrics?.storage_used_bytes);
   const storageTotalBytes = asNumber(metrics?.storage_total_bytes);
   const metricsUpdatedAt = formatTimestamp(metrics?.updated_at ?? node.last_heartbeat_at);
+  const vmReady = node.state === "paired" && node.capabilities?.vm?.ready === true;
+  const resourceUsageSection = (
+    <section className="usage-card">
+      <div className="usage-card-header">
+        <h3>Resource Usage</h3>
+        <span className="muted usage-updated">Updated: {metricsUpdatedAt}</span>
+      </div>
+      <div className="usage-metrics-grid">
+        <MetricBar label="CPU" percent={cpuPercent} detail="Processor load" />
+        <MetricBar
+          label="Memory"
+          percent={memoryPercent}
+          detail={usageDetail(memoryUsedBytes, memoryTotalBytes)}
+        />
+        <MetricBar
+          label="Storage"
+          percent={storagePercent}
+          detail={usageDetail(storageUsedBytes, storageTotalBytes)}
+        />
+      </div>
+    </section>
+  );
 
   async function confirmRename() {
     if (!node) {
@@ -568,6 +595,18 @@ export default function NodeDetailPage({
         </button>
         <button
           type="button"
+          className="secondary-button"
+          disabled={!vmReady}
+          onClick={() => {
+            setActiveTab("vms");
+            setOpenCreateVmIntent((value) => value + 1);
+          }}
+        >
+          <FontAwesomeIcon icon={faPlus} />
+          <span>Create VM</span>
+        </button>
+        <button
+          type="button"
           className="node-delete-button"
           onClick={() => {
             setConfirmDeleteOpen(true);
@@ -579,124 +618,152 @@ export default function NodeDetailPage({
         </button>
       </div>
 
-      <div className="node-detail-header">
-        <div className="node-detail-main">
-          <div className="node-detail-title-row">
-            <p className="stat-label">Node Details</p>
-            <div className="node-health-badges">
-              <span className={`health health-${health}`}>
-                <span className="dot" />
-                {health}
-              </span>
-            </div>
-          </div>
-          <p className="muted node-detail-subtitle">
-            id: <code>{node.id}</code>
-          </p>
-          <p className="muted node-detail-subtitle">
-            commit:{" "}
-            {agentCommit ? <code title={agentCommit}>{shortCommitHash(agentCommit)}</code> : "Unknown"}
-          </p>
-          <p className="muted node-detail-subtitle os-row">
-            {agentOs ?? "Unknown OS"}
-            {agentOsIcon ? <FontAwesomeIcon icon={agentOsIcon} className="os-icon" /> : null}
-          </p>
-          <div className="node-meta-grid">
-            <div className="node-meta-item">
-              <span className="node-meta-label">Pair Code</span>
-              <strong className="node-meta-value">
-                <code>{node.pair_code}</code>
-              </strong>
-            </div>
-            <div className="node-meta-item">
-              <span className="node-meta-label">Created</span>
-              <strong className="node-meta-value">{formatTimestamp(node.created_at)}</strong>
-            </div>
-            <div className="node-meta-item">
-              <span className="node-meta-label">Paired At</span>
-              <strong className="node-meta-value">{formatTimestamp(node.paired_at)}</strong>
-            </div>
-          </div>
-        </div>
-        <div className="node-detail-status">
-          <p className="muted node-health-meta">
-            Last heartbeat: {formatTimestamp(node.last_heartbeat_at)} ({heartbeatAge})
-          </p>
-        </div>
+      <div className="node-tabs" role="tablist" aria-label="Node Detail Tabs">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "main"}
+          className={`node-tab ${activeTab === "main" ? "node-tab-active" : ""}`}
+          onClick={() => setActiveTab("main")}
+        >
+          Main
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "stats"}
+          className={`node-tab ${activeTab === "stats" ? "node-tab-active" : ""}`}
+          onClick={() => setActiveTab("stats")}
+        >
+          Stats
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "vms"}
+          className={`node-tab ${activeTab === "vms" ? "node-tab-active" : ""}`}
+          onClick={() => setActiveTab("vms")}
+        >
+          VMs
+        </button>
       </div>
 
-      <section className="usage-card">
-        <div className="usage-card-header">
-          <h3>Resource Usage</h3>
-          <span className="muted usage-updated">Updated: {metricsUpdatedAt}</span>
-        </div>
-        <div className="usage-metrics-grid">
-          <MetricBar label="CPU" percent={cpuPercent} detail="Processor load" />
-          <MetricBar
-            label="Memory"
-            percent={memoryPercent}
-            detail={usageDetail(memoryUsedBytes, memoryTotalBytes)}
-          />
-          <MetricBar
-            label="Storage"
-            percent={storagePercent}
-            detail={usageDetail(storageUsedBytes, storageTotalBytes)}
-          />
-        </div>
-      </section>
-
-      <section className="log-card">
-        <div className="log-card-header">
-          <div className="log-card-heading">
-            <h3>Log</h3>
-            {streamConnected && node.state !== "pending" ? (
-              <span className="health health-healthy">
-                <span className="dot" />
-                live
-              </span>
-            ) : null}
+      {activeTab === "main" ? (
+        <>
+          <div className="node-detail-header">
+            <div className="node-detail-main">
+              <div className="node-detail-title-row">
+                <p className="stat-label">Node Details</p>
+                <div className="node-health-badges">
+                  <span className={`health health-${health}`}>
+                    <span className="dot" />
+                    {health}
+                  </span>
+                </div>
+              </div>
+              <p className="muted node-detail-subtitle">
+                id: <code>{node.id}</code>
+              </p>
+              <p className="muted node-detail-subtitle">
+                commit:{" "}
+                {agentCommit ? <code title={agentCommit}>{shortCommitHash(agentCommit)}</code> : "Unknown"}
+              </p>
+              <p className="muted node-detail-subtitle os-row">
+                {agentOs ?? "Unknown OS"}
+                {agentOsIcon ? <FontAwesomeIcon icon={agentOsIcon} className="os-icon" /> : null}
+              </p>
+              <div className="node-meta-grid">
+                <div className="node-meta-item">
+                  <span className="node-meta-label">Pair Code</span>
+                  <strong className="node-meta-value">
+                    <code>{node.pair_code}</code>
+                  </strong>
+                </div>
+                <div className="node-meta-item">
+                  <span className="node-meta-label">Created</span>
+                  <strong className="node-meta-value">{formatTimestamp(node.created_at)}</strong>
+                </div>
+                <div className="node-meta-item">
+                  <span className="node-meta-label">Paired At</span>
+                  <strong className="node-meta-value">{formatTimestamp(node.paired_at)}</strong>
+                </div>
+              </div>
+            </div>
+            <div className="node-detail-status">
+              <p className="muted node-health-meta">
+                Last heartbeat: {formatTimestamp(node.last_heartbeat_at)} ({heartbeatAge})
+              </p>
+            </div>
           </div>
-          <button
-            type="button"
-            className="log-refresh-button"
-            onClick={() => {
-              setUsePolling(false);
-              setLogsError(null);
-              setStreamRevision((value) => value + 1);
-            }}
-            disabled={logsLoading}
-          >
-            <FontAwesomeIcon icon={faRotateRight} />
-            <span>Refresh</span>
-          </button>
-        </div>
 
-        {logsError ? <p className="error">{logsError}</p> : null}
+          {resourceUsageSection}
 
-        <div className="log-stream" ref={logsContainerRef}>
-          {logsLoading && logs.length === 0 ? (
-            <p className="muted">Loading logs...</p>
-          ) : null}
-          {!logsLoading && logs.length === 0 ? <p className="muted">No logs available yet.</p> : null}
-          {logs.length > 0 ? (
-            <ul className="log-lines">
-              {logs.map((entry) => {
-                const hostname = getMetaHostname(entry.meta);
-                return (
-                  <li key={entry.id} className="log-line">
-                    <span className="log-time">{formatLogTime(entry.created_at)}</span>
-                    <span className={`log-level log-level-${entry.level}`}>{entry.level}</span>
-                    <span className="log-message">
-                      {entry.message}
-                      {hostname ? <span className="log-meta"> [{hostname}]</span> : null}
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-          ) : null}
-        </div>
-      </section>
+          <section className="log-card">
+            <div className="log-card-header">
+              <div className="log-card-heading">
+                <h3>Log</h3>
+                {streamConnected && node.state !== "pending" ? (
+                  <span className="health health-healthy">
+                    <span className="dot" />
+                    live
+                  </span>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                className="log-refresh-button"
+                onClick={() => {
+                  setUsePolling(false);
+                  setLogsError(null);
+                  setStreamRevision((value) => value + 1);
+                }}
+                disabled={logsLoading}
+              >
+                <FontAwesomeIcon icon={faRotateRight} />
+                <span>Refresh</span>
+              </button>
+            </div>
+
+            {logsError ? <p className="error">{logsError}</p> : null}
+
+            <div className="log-stream" ref={logsContainerRef}>
+              {logsLoading && logs.length === 0 ? (
+                <p className="muted">Loading logs...</p>
+              ) : null}
+              {!logsLoading && logs.length === 0 ? <p className="muted">No logs available yet.</p> : null}
+              {logs.length > 0 ? (
+                <ul className="log-lines">
+                  {logs.map((entry) => {
+                    const hostname = getMetaHostname(entry.meta);
+                    return (
+                      <li key={entry.id} className="log-line">
+                        <span className="log-time">{formatLogTime(entry.created_at)}</span>
+                        <span className={`log-level log-level-${entry.level}`}>{entry.level}</span>
+                        <span className="log-message">
+                          {entry.message}
+                          {hostname ? <span className="log-meta"> [{hostname}]</span> : null}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : null}
+            </div>
+          </section>
+        </>
+      ) : null}
+
+      {activeTab === "stats" ? (
+        resourceUsageSection
+      ) : null}
+
+      {activeTab === "vms" ? (
+        <NodeVmsPanel
+          node={node}
+          apiBaseUrl={apiBaseUrl}
+          openCreateIntent={openCreateVmIntent}
+        />
+      ) : null}
 
       {confirmUpdateOpen ? (
         <div
