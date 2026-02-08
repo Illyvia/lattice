@@ -186,12 +186,8 @@ class AgentWebSocketStreamer:
                                 in {"terminal_open", "terminal_input", "terminal_resize", "terminal_close"}
                                 and self.terminal_handler
                             ):
-                                threading.Thread(
-                                    target=self.terminal_handler,
-                                    args=(inbound,),
-                                    name="agent-terminal-handler",
-                                    daemon=True,
-                                ).start()
+                                # Terminal control/data must preserve strict ordering (open -> input -> resize -> close).
+                                self.terminal_handler(inbound)
                     except websocket.WebSocketTimeoutException:
                         pass
 

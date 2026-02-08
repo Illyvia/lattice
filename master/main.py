@@ -929,9 +929,6 @@ def ws_node_terminal(ws, node_id: str):
     if node.get("state") != "paired":
         ws.send(json.dumps({"type": "terminal_error", "error": "node_not_paired"}))
         return
-    if not _is_agent_connected(clean_node_id):
-        ws.send(json.dumps({"type": "terminal_error", "error": "agent_not_connected"}))
-        return
 
     query_string = ""
     environ = getattr(ws, "environ", None)
@@ -952,6 +949,17 @@ def ws_node_terminal(ws, node_id: str):
             "rows": rows,
         },
     )
+    if not _is_agent_connected(clean_node_id):
+        try:
+            inbound_queue.put_nowait(
+                {
+                    "type": "terminal_data",
+                    "session_id": session_id,
+                    "data": "\r\n[waiting for agent websocket connection...]\r\n",
+                }
+            )
+        except queue.Full:
+            pass
 
     append_node_log(
         DB_PATH,
