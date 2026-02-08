@@ -493,6 +493,9 @@ def _create_vm(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         f"path={seed_path},device=cdrom",
         "--network",
         f"bridge={bridge},model=virtio",
+        # Newer virt-install builds require explicit OS info to avoid unsafe defaults.
+        "--osinfo",
+        "detect=on,require=off",
         "--graphics",
         "none",
         "--noautoconsole",
