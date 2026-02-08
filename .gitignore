@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+agent/state.json
+master/master.db
+master/master.db*
+master/master/master.db
+
+# Runtime logs
+logs/
+master/logs/
+
+master/ui/node_modules/
+master/ui/dist/
