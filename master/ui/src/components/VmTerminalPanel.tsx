@@ -50,6 +50,14 @@ function isFatalVmTerminalError(detail: string): boolean {
   );
 }
 
+function normalizeVmConsoleChunk(chunk: string): string {
+  if (!chunk) {
+    return chunk;
+  }
+  // Serial consoles sometimes emit bare LF and NUL padding; normalize for xterm.
+  return chunk.replace(/\u0000/g, "").replace(/\r?\n/g, "\r\n");
+}
+
 export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: VmTerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -77,7 +85,7 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
     const theme = readThemeMode();
     const terminal = new Terminal({
       cursorBlink: true,
-      convertEol: false,
+      convertEol: true,
       fontFamily: "JetBrains Mono, Consolas, monospace",
       fontSize: 13,
       lineHeight: 1.25,
@@ -206,7 +214,7 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       }
       if (message.type === "terminal_data") {
         if (typeof message.data === "string") {
-          terminalInstance.write(message.data);
+          terminalInstance.write(normalizeVmConsoleChunk(message.data));
         }
         return;
       }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
   faArrowLeft,
@@ -8,7 +8,7 @@ import {
   faTrashCan,
 } from "@fortawesome/free-solid-svg-icons";
 import { useNavigate, useParams } from "react-router-dom";
-import { toast } from "react-toastify";
+import { Id as ToastId, toast } from "react-toastify";
 import VmTerminalPanel from "../components/VmTerminalPanel";
 import { NodeRecord, NodeVmRecord, VmOperationRecord } from "../types";
 import { formatTimestamp } from "../utils/health";
@@ -41,8 +41,60 @@ export default function VmDetailPage({ nodes, apiBaseUrl }: VmDetailPageProps) {
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<"main" | "terminal">("main");
   const [refreshNonce, setRefreshNonce] = useState(0);
+  const pendingOperationToastsRef = useRef<Map<string, ToastId>>(new Map());
+  const pendingOperationTimeoutsRef = useRef<Map<string, number>>(new Map());
+  const pendingDeleteToastRef = useRef<{ toastId: ToastId; vmId: string } | null>(null);
 
   const vmActionsDisabled = useMemo(() => actionBusy !== null || !vm, [actionBusy, vm]);
+
+  function registerPendingOperationToast(
+    nextVm: NodeVmRecord,
+    fallbackAction: VmAction,
+    operation: VmOperationRecord | null = null
+  ): void {
+    const op = operation ?? nextVm.last_operation ?? null;
+    const operationType = op?.operation_type ?? fallbackAction;
+    const status = op?.status;
+
+    if (op?.id && (status === "queued" || status === "running")) {
+      if (pendingOperationToastsRef.current.has(op.id)) {
+        return;
+      }
+      const toastId = toast.loading(`VM ${operationType} in progress...`);
+      pendingOperationToastsRef.current.set(op.id, toastId);
+      const timeoutId = window.setTimeout(() => {
+        const pendingToastId = pendingOperationToastsRef.current.get(op.id);
+        if (!pendingToastId) {
+          return;
+        }
+        toast.update(pendingToastId, {
+          render: `VM ${operationType} is still in progress. Check operation timeline for updates.`,
+          type: "info",
+          isLoading: false,
+          autoClose: 6000,
+          closeButton: true,
+        });
+        pendingOperationToastsRef.current.delete(op.id);
+        pendingOperationTimeoutsRef.current.delete(op.id);
+      }, 180000);
+      pendingOperationTimeoutsRef.current.set(op.id, timeoutId);
+      if (operationType === "delete") {
+        pendingDeleteToastRef.current = { toastId, vmId: nextVm.id };
+      }
+      return;
+    }
+
+    if (status === "succeeded") {
+      toast.success(`VM ${operationType} completed`);
+      return;
+    }
+    if (status === "failed") {
+      toast.error(op?.error ? `VM ${operationType} failed: ${op.error}` : `VM ${operationType} failed`);
+      return;
+    }
+
+    toast.info(`VM ${operationType} request accepted`);
+  }
 
   useEffect(() => {
     setActiveTab("main");
@@ -67,6 +119,24 @@ export default function VmDetailPage({ nodes, apiBaseUrl }: VmDetailPageProps) {
           ),
           { cache: "no-store" }
         );
+        if (resp.status === 404 && pendingDeleteToastRef.current) {
+          const pendingDelete = pendingDeleteToastRef.current;
+          toast.update(pendingDelete.toastId, {
+            render: "VM deleted",
+            type: "success",
+            isLoading: false,
+            autoClose: 4200,
+            closeButton: true,
+          });
+          pendingDeleteToastRef.current = null;
+          for (const timeoutId of pendingOperationTimeoutsRef.current.values()) {
+            window.clearTimeout(timeoutId);
+          }
+          pendingOperationTimeoutsRef.current.clear();
+          pendingOperationToastsRef.current.clear();
+          navigate(`/node/${encodeURIComponent(cleanNodeId)}?tab=vms`);
+          return;
+        }
         const body = (await resp.json().catch(() => ({}))) as { error?: string };
         if (!resp.ok) {
           throw new Error(body.error ?? `Failed to load VM (${resp.status})`);
@@ -140,6 +210,67 @@ export default function VmDetailPage({ nodes, apiBaseUrl }: VmDetailPageProps) {
     };
   }, [apiBaseUrl, cleanNodeId, cleanVmId, refreshNonce]);
 
+  useEffect(() => {
+    for (const operation of operations) {
+      const toastId = pendingOperationToastsRef.current.get(operation.id);
+      if (!toastId) {
+        continue;
+      }
+      if (operation.status === "succeeded") {
+        toast.update(toastId, {
+          render: `VM ${operation.operation_type} completed`,
+          type: "success",
+          isLoading: false,
+          autoClose: 4200,
+          closeButton: true,
+        });
+        pendingOperationToastsRef.current.delete(operation.id);
+        const timeoutId = pendingOperationTimeoutsRef.current.get(operation.id);
+        if (typeof timeoutId === "number") {
+          window.clearTimeout(timeoutId);
+        }
+        pendingOperationTimeoutsRef.current.delete(operation.id);
+        if (operation.operation_type === "delete") {
+          pendingDeleteToastRef.current = null;
+          navigate(`/node/${encodeURIComponent(cleanNodeId)}?tab=vms`);
+        }
+        continue;
+      }
+      if (operation.status === "failed") {
+        toast.update(toastId, {
+          render:
+            operation.error
+              ? `VM ${operation.operation_type} failed: ${operation.error}`
+              : `VM ${operation.operation_type} failed`,
+          type: "error",
+          isLoading: false,
+          autoClose: 7000,
+          closeButton: true,
+        });
+        pendingOperationToastsRef.current.delete(operation.id);
+        const timeoutId = pendingOperationTimeoutsRef.current.get(operation.id);
+        if (typeof timeoutId === "number") {
+          window.clearTimeout(timeoutId);
+        }
+        pendingOperationTimeoutsRef.current.delete(operation.id);
+        if (operation.operation_type === "delete") {
+          pendingDeleteToastRef.current = null;
+        }
+      }
+    }
+  }, [cleanNodeId, navigate, operations]);
+
+  useEffect(() => {
+    return () => {
+      for (const timeoutId of pendingOperationTimeoutsRef.current.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      pendingOperationTimeoutsRef.current.clear();
+      pendingOperationToastsRef.current.clear();
+      pendingDeleteToastRef.current = null;
+    };
+  }, []);
+
   async function runVmAction(action: VmAction) {
     if (!vm || !cleanNodeId || !cleanVmId) {
       return;
@@ -158,19 +289,25 @@ export default function VmDetailPage({ nodes, apiBaseUrl }: VmDetailPageProps) {
           headers: { "Content-Type": "application/json" },
         }
       );
-      const body = (await resp.json().catch(() => ({}))) as { vm?: NodeVmRecord; error?: string };
+      const body = (await resp.json().catch(() => ({}))) as {
+        vm?: NodeVmRecord;
+        operation?: VmOperationRecord;
+        error?: string;
+      };
       if (!resp.ok) {
         throw new Error(body.error ?? `Failed VM ${action} (${resp.status})`);
       }
       if (body.vm) {
-        setVm(body.vm);
+        const nextVm = body.vm;
+        setVm(nextVm);
+        registerPendingOperationToast(nextVm, action, body.operation ?? null);
+      } else {
+        toast.info(`VM ${action} request accepted`);
       }
       if (action === "delete") {
-        toast.success("VM delete queued");
-        navigate(`/node/${encodeURIComponent(cleanNodeId)}?tab=vms`);
+        setConfirmDeleteOpen(false);
         return;
       }
-      toast.info(`VM ${action} queued`);
       setRefreshNonce((value) => value + 1);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : `Failed VM ${action}`);
@@ -387,4 +524,3 @@ export default function VmDetailPage({ nodes, apiBaseUrl }: VmDetailPageProps) {
     </section>
   );
 }
-

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import HomePage from "./pages/HomePage";
@@ -7,7 +7,7 @@ import NodeDetailPage from "./pages/NodeDetailPage";
 import NodesPage from "./pages/NodesPage";
 import VmDetailPage from "./pages/VmDetailPage";
 import { NodeRecord, ThemeMode } from "./types";
-import { ToastContainer, toast } from "react-toastify";
+import { ToastContainer, Id as ToastId, toast } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
 
 const configuredApiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
@@ -45,6 +45,8 @@ export default function App() {
 
   const location = useLocation();
   const navigate = useNavigate();
+  const updateToastTimersRef = useRef<Map<string, number>>(new Map());
+  const updateToastIdsRef = useRef<Map<string, ToastId>>(new Map());
 
   const loadNodes = useCallback(async () => {
     try {
@@ -76,6 +78,151 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem("lattice-sidebar-collapsed", sidebarCollapsed ? "1" : "0");
   }, [sidebarCollapsed]);
+
+  const clearUpdateToastTracker = useCallback((nodeId: string) => {
+    const timer = updateToastTimersRef.current.get(nodeId);
+    if (typeof timer === "number") {
+      window.clearTimeout(timer);
+    }
+    updateToastTimersRef.current.delete(nodeId);
+    updateToastIdsRef.current.delete(nodeId);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of updateToastTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      updateToastTimersRef.current.clear();
+      updateToastIdsRef.current.clear();
+    };
+  }, []);
+
+  const trackUpdateCommand = useCallback(
+    (nodeId: string, commandId: string, toastId: ToastId) => {
+      clearUpdateToastTracker(nodeId);
+      updateToastIdsRef.current.set(nodeId, toastId);
+      const startedAt = Date.now();
+
+      const poll = async () => {
+        const currentToastId = updateToastIdsRef.current.get(nodeId);
+        if (currentToastId !== toastId) {
+          return;
+        }
+        try {
+          const response = await fetch(apiUrl(`/api/nodes/${encodeURIComponent(nodeId)}/logs?limit=200`), {
+            cache: "no-store",
+          });
+          if (response.ok) {
+            const body = (await response.json().catch(() => ({}))) as {
+              items?: Array<{ message?: unknown; meta?: Record<string, unknown> | null }>;
+            };
+            const items = Array.isArray(body.items) ? body.items : [];
+            const match = items
+              .slice()
+              .reverse()
+              .find((item) => {
+                if (!item || typeof item !== "object") {
+                  return false;
+                }
+                const message = typeof item.message === "string" ? item.message : "";
+                const meta = item.meta;
+                const metaCommandType =
+                  meta && typeof meta === "object" && typeof meta.command_type === "string"
+                    ? meta.command_type
+                    : null;
+                if (metaCommandType !== "update_agent" && !message.includes("Agent command update_agent ->")) {
+                  return false;
+                }
+                const metaCommandId =
+                  meta && typeof meta === "object" && typeof meta.command_id === "string"
+                    ? meta.command_id
+                    : null;
+                return metaCommandId === commandId;
+              });
+
+            if (match) {
+              const meta = match.meta;
+              const metaStatus =
+                meta && typeof meta === "object" && typeof meta.status === "string"
+                  ? meta.status.trim().toLowerCase()
+                  : null;
+              const message = typeof match.message === "string" ? match.message : "";
+              if (metaStatus === "updated" || metaStatus === "up_to_date" || metaStatus === "succeeded") {
+                toast.update(toastId, {
+                  render:
+                    metaStatus === "up_to_date"
+                      ? "Agent already up to date"
+                      : "Agent update completed",
+                  type: "success",
+                  isLoading: false,
+                  autoClose: 4200,
+                  closeButton: true,
+                });
+                clearUpdateToastTracker(nodeId);
+                return;
+              }
+              if (metaStatus === "failed" || metaStatus === "error" || metaStatus === "busy") {
+                toast.update(toastId, {
+                  render: message || "Agent update failed",
+                  type: "error",
+                  isLoading: false,
+                  autoClose: 6000,
+                  closeButton: true,
+                });
+                clearUpdateToastTracker(nodeId);
+                return;
+              }
+              if (message.includes("-> succeeded")) {
+                toast.update(toastId, {
+                  render: "Agent update completed",
+                  type: "success",
+                  isLoading: false,
+                  autoClose: 4200,
+                  closeButton: true,
+                });
+                clearUpdateToastTracker(nodeId);
+                return;
+              }
+              if (message.includes("-> failed") || message.includes("-> error")) {
+                toast.update(toastId, {
+                  render: message,
+                  type: "error",
+                  isLoading: false,
+                  autoClose: 6000,
+                  closeButton: true,
+                });
+                clearUpdateToastTracker(nodeId);
+                return;
+              }
+            }
+          }
+        } catch {
+          // Ignore polling blips and keep waiting for command completion.
+        }
+
+        if (Date.now() - startedAt > 180000) {
+          toast.update(toastId, {
+            render: "Update is still running. Check node logs for completion.",
+            type: "info",
+            isLoading: false,
+            autoClose: 6000,
+            closeButton: true,
+          });
+          clearUpdateToastTracker(nodeId);
+          return;
+        }
+
+        const timer = window.setTimeout(() => {
+          void poll();
+        }, 2000);
+        updateToastTimersRef.current.set(nodeId, timer);
+      };
+
+      void poll();
+    },
+    [clearUpdateToastTracker]
+  );
 
   async function onCreateNode(name: string | null) {
     setLoading(true);
@@ -216,6 +363,7 @@ export default function App() {
   }
 
   async function onUpdateNode(nodeId: string) {
+    const loadingToastId = toast.loading("Sending update command...");
     const resp = await fetch(apiUrl(`/api/nodes/${nodeId}/actions/update-agent`), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -225,21 +373,52 @@ export default function App() {
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
       const message = body.error ?? `Failed to queue agent update (${resp.status})`;
-      toast.error(message);
+      toast.update(loadingToastId, {
+        render: message,
+        type: "error",
+        isLoading: false,
+        autoClose: 6000,
+        closeButton: true,
+      });
       throw new Error(message);
     }
 
     const body = (await resp.json()) as {
+      command_id?: string;
       agent_connected?: boolean;
       agent_ws_connected?: boolean;
       recent_heartbeat?: boolean;
     };
     if (body.agent_connected === false) {
-      toast.info("Update request accepted. It will run when the node command channel reconnects.");
+      toast.update(loadingToastId, {
+        render: "Update queued. Waiting for node command channel reconnect...",
+        isLoading: true,
+        autoClose: false,
+      });
     } else if (body.agent_ws_connected === false && body.recent_heartbeat === true) {
-      toast.info("Update request accepted. Node is online and command dispatch is catching up.");
+      toast.update(loadingToastId, {
+        render: "Update queued. Node is online and command dispatch is catching up...",
+        isLoading: true,
+        autoClose: false,
+      });
     } else {
-      toast.info("Update command sent to node.");
+      toast.update(loadingToastId, {
+        render: "Update running...",
+        isLoading: true,
+        autoClose: false,
+      });
+    }
+
+    if (typeof body.command_id === "string" && body.command_id.trim()) {
+      trackUpdateCommand(nodeId, body.command_id.trim(), loadingToastId);
+    } else {
+      toast.update(loadingToastId, {
+        render: "Update command accepted",
+        type: "success",
+        isLoading: false,
+        autoClose: 4200,
+        closeButton: true,
+      });
     }
   }
 

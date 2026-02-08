@@ -19,6 +19,7 @@ try:
     import fcntl
     import pty
     import termios
+    import tty
 
     PTY_AVAILABLE = True
 except Exception:
@@ -477,6 +478,7 @@ class TerminalSessionManager:
         self._logger = logger
         self._lock = threading.Lock()
         self._sessions: dict[str, dict[str, Any]] = {}
+        self._vm_domain_to_session: dict[str, str] = {}
 
     @staticmethod
     def _clamp(value: Any, default_value: int, min_value: int, max_value: int) -> int:
@@ -513,6 +515,11 @@ class TerminalSessionManager:
         packed = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
 
+    def _set_raw_mode(self, fd: int) -> None:
+        if not PTY_AVAILABLE:
+            return
+        tty.setraw(fd)
+
     @staticmethod
     def _is_running_as_root() -> bool:
         if hasattr(os, "geteuid"):
@@ -539,6 +546,8 @@ class TerminalSessionManager:
         env: dict[str, str] | None,
         session_kind: str,
         error_prefix: str,
+        raw_tty: bool = False,
+        vm_domain_name: str | None = None,
     ) -> None:
         clean_session_id = (session_id or "").strip()
         if not clean_session_id:
@@ -559,6 +568,9 @@ class TerminalSessionManager:
         try:
             master_fd, slave_fd = pty.openpty()
             self._set_terminal_size(master_fd, terminal_cols, terminal_rows)
+            if raw_tty:
+                # `virsh console` is a serial stream and behaves better in raw mode.
+                self._set_raw_mode(slave_fd)
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
@@ -608,7 +620,10 @@ class TerminalSessionManager:
                 "thread": reader_thread,
                 "send_exit": True,
                 "kind": session_kind,
+                "vm_domain_name": vm_domain_name,
             }
+            if isinstance(vm_domain_name, str) and vm_domain_name.strip():
+                self._vm_domain_to_session[vm_domain_name.strip()] = clean_session_id
         reader_thread.start()
         self._logger.info(f"Opened {session_kind} session session_id={clean_session_id}")
 
@@ -681,6 +696,12 @@ class TerminalSessionManager:
 
             with self._lock:
                 latest = self._sessions.pop(session_id, None)
+                if latest:
+                    vm_domain_name = latest.get("vm_domain_name")
+                    if isinstance(vm_domain_name, str) and vm_domain_name.strip():
+                        mapped_session_id = self._vm_domain_to_session.get(vm_domain_name)
+                        if mapped_session_id == session_id:
+                            self._vm_domain_to_session.pop(vm_domain_name, None)
             if latest:
                 send_exit = bool(latest.get("send_exit", True))
 
@@ -719,6 +740,7 @@ class TerminalSessionManager:
             env=env,
             session_kind="terminal",
             error_prefix="Unable to start terminal",
+            raw_tty=False,
         )
 
     def open_vm_session(self, session_id: str, domain_name: Any, cols: Any, rows: Any) -> None:
@@ -736,6 +758,14 @@ class TerminalSessionManager:
         if not self._is_running_as_root() and shutil.which("sudo") is None:
             self._send_error(clean_session_id, "sudo is required to access libvirt console")
             return
+
+        with self._lock:
+            existing_session_id = self._vm_domain_to_session.get(clean_domain_name)
+        if isinstance(existing_session_id, str) and existing_session_id and existing_session_id != clean_session_id:
+            self._logger.info(
+                f"Replacing existing VM console session domain={clean_domain_name} old_session={existing_session_id} new_session={clean_session_id}"
+            )
+            self.close_session(existing_session_id, send_exit=False)
 
         state_command = self._virsh_command("domstate", clean_domain_name)
         try:
@@ -770,11 +800,13 @@ class TerminalSessionManager:
             session_id=clean_session_id,
             cols=cols,
             rows=rows,
-            command=self._virsh_command("console", clean_domain_name),
+            command=self._virsh_command("console", clean_domain_name, "--force"),
             cwd=str(ROOT_DIR),
             env=env,
             session_kind="vm_console",
             error_prefix="Unable to open VM console",
+            raw_tty=True,
+            vm_domain_name=clean_domain_name,
         )
 
     def write_input(self, session_id: str, data: Any) -> None:
