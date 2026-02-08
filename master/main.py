@@ -985,7 +985,9 @@ def ws_node_terminal(ws, node_id: str):
             except TimeoutError:
                 continue
             if raw is None:
-                break
+                # simple-websocket returns None on timeout when no frame is available.
+                # Treat this as idle and keep the session open.
+                continue
 
             try:
                 payload = json.loads(raw)
@@ -1078,7 +1080,8 @@ def ws_agent(ws):
             except TimeoutError:
                 continue
             if raw is None:
-                break
+                # simple-websocket returns None on timeout when idle.
+                continue
 
             try:
                 payload = json.loads(raw)
