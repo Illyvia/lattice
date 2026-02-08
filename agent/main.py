@@ -211,11 +211,12 @@ def execute_agent_update(force: bool = False, branch: str | None = None) -> tupl
             if normalized in ignored_local_paths:
                 continue
             changed_files.append(path)
-        return (
-            ("failed", "Working tree has local changes; commit, stash, or discard changes before update", {"changed_files": changed_files[:25]})
-            if changed_files
-            else ("up_to_date", "Only local config changes detected; update can continue", {"changed_files": []})
-        )
+        if changed_files:
+            return (
+                "failed",
+                "Working tree has local changes; commit, stash, or discard changes before update",
+                {"changed_files": changed_files[:25]},
+            )
 
     fetch_args = ["git", "fetch", "--all", "--prune"]
     if branch_name:
