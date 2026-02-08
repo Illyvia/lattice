@@ -976,6 +976,7 @@ def main() -> None:
             pair_token=current_state["pair_token"],
             command_handler=handle_ws_command,
             terminal_handler=handle_terminal_event,
+            status_logger=lambda message: log.info(message),
         )
         ws_streamer.start()
         ws_log_handler = WebSocketLogHandler(ws_streamer)

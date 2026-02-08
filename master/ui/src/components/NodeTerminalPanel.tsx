@@ -38,6 +38,9 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectScheduledRef = useRef(false);
   const [connected, setConnected] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
@@ -109,6 +112,11 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
 
     return () => {
       observer.disconnect();
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      reconnectScheduledRef.current = false;
       socketRef.current?.close();
       socketRef.current = null;
       terminalRef.current?.dispose();
@@ -125,9 +133,16 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
     }
 
     let closedByClient = false;
+    let isDisposed = false;
+    let sawAgentNotConnected = false;
     setConnecting(true);
     setConnected(false);
     setSessionId(null);
+    reconnectScheduledRef.current = false;
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
 
     const socket = new WebSocket(wsUrl);
     socketRef.current = socket;
@@ -159,6 +174,7 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
     socket.onopen = () => {
       setConnecting(false);
       setConnected(true);
+      reconnectAttemptsRef.current = 0;
       onResize();
       terminal.writeln("");
       terminal.writeln("\u001b[32mConnected.\u001b[0m");
@@ -196,6 +212,11 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
       }
       if (message.type === "terminal_error") {
         const detail = message.error || "terminal error";
+        if (detail === "agent_not_connected" || detail.toLowerCase().includes("agent websocket disconnected")) {
+          sawAgentNotConnected = true;
+          terminalInstance.writeln("\r\n\u001b[33m[waiting for agent websocket connection...]\u001b[0m");
+          return;
+        }
         terminalInstance.writeln(`\r\n\u001b[31m[terminal error] ${detail}\u001b[0m`);
         toast.error(`Terminal error: ${detail}`);
       }
@@ -203,9 +224,30 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
 
     socket.onerror = () => {
       const terminalInstance = terminalRef.current;
-      if (terminalInstance) {
+      if (terminalInstance && !sawAgentNotConnected) {
         terminalInstance.writeln("\r\n\u001b[31m[connection error]\u001b[0m");
       }
+    };
+
+    const scheduleReconnect = () => {
+      if (closedByClient || isDisposed || reconnectScheduledRef.current) {
+        return;
+      }
+      reconnectScheduledRef.current = true;
+      const nextAttempt = Math.min(reconnectAttemptsRef.current + 1, 8);
+      reconnectAttemptsRef.current = nextAttempt;
+      const delayMs = Math.min(1000 * 2 ** (nextAttempt - 1), 10000);
+      const terminalInstance = terminalRef.current;
+      if (terminalInstance) {
+        terminalInstance.writeln(`\u001b[90m[reconnecting in ${Math.round(delayMs / 1000)}s]\u001b[0m`);
+      }
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        reconnectScheduledRef.current = false;
+        if (!closedByClient && !isDisposed) {
+          setReconnectKey((value) => value + 1);
+        }
+      }, delayMs);
     };
 
     socket.onclose = () => {
@@ -221,12 +263,19 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
             : "\u001b[31m[terminal connection closed]\u001b[0m"
         );
       }
+      scheduleReconnect();
     };
 
     return () => {
+      isDisposed = true;
       onDataDisposable.dispose();
       window.removeEventListener("resize", onResize);
       closedByClient = true;
+      reconnectScheduledRef.current = false;
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       try {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: "close" }));
