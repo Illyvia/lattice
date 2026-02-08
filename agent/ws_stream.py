@@ -3,6 +3,7 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Callable
 from urllib.parse import urlparse, urlunparse
 
 import websocket
@@ -20,12 +21,14 @@ class AgentWebSocketStreamer:
         master_url: str,
         node_id: str,
         pair_token: str,
+        command_handler: Callable[[dict], None] | None = None,
         reconnect_seconds: int = 3,
         queue_size: int = 1000,
     ) -> None:
         self.ws_url = build_agent_ws_url(master_url)
         self.node_id = node_id
         self.pair_token = pair_token
+        self.command_handler = command_handler
         self.reconnect_seconds = max(1, reconnect_seconds)
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=max(10, queue_size))
         self._stop_event = threading.Event()
@@ -67,6 +70,25 @@ class AgentWebSocketStreamer:
             return
         self._enqueue({"type": "heartbeat", "payload": payload})
 
+    def send_command_result(
+        self,
+        command_id: str,
+        command_type: str,
+        status: str,
+        message: str,
+        details: dict | None = None,
+    ) -> None:
+        event: dict = {
+            "type": "command_result",
+            "command_id": str(command_id),
+            "command_type": str(command_type),
+            "status": str(status),
+            "message": str(message),
+        }
+        if isinstance(details, dict) and details:
+            event["details"] = details
+        self._enqueue(event)
+
     def _enqueue(self, event: dict) -> None:
         try:
             self._queue.put_nowait(event)
@@ -85,6 +107,7 @@ class AgentWebSocketStreamer:
             ws = None
             try:
                 ws = websocket.create_connection(self.ws_url, timeout=10)
+                ws.settimeout(1)
                 ws.send(
                     json.dumps(
                         {
@@ -100,12 +123,36 @@ class AgentWebSocketStreamer:
                 if not isinstance(auth_response, dict) or auth_response.get("type") != "auth_ok":
                     raise RuntimeError(f"ws auth failed: {auth_response}")
 
+                last_ping_at = time.monotonic()
                 while not self._stop_event.is_set():
                     try:
-                        event = self._queue.get(timeout=1)
+                        event = self._queue.get_nowait()
+                        ws.send(json.dumps(event))
                     except queue.Empty:
-                        continue
-                    ws.send(json.dumps(event))
+                        pass
+
+                    try:
+                        inbound_raw = ws.recv()
+                        if inbound_raw:
+                            inbound = json.loads(inbound_raw)
+                            if (
+                                isinstance(inbound, dict)
+                                and inbound.get("type") == "command"
+                                and self.command_handler
+                            ):
+                                threading.Thread(
+                                    target=self.command_handler,
+                                    args=(inbound,),
+                                    name="agent-command-handler",
+                                    daemon=True,
+                                ).start()
+                    except websocket.WebSocketTimeoutException:
+                        pass
+
+                    now = time.monotonic()
+                    if now - last_ping_at >= 15:
+                        ws.send(json.dumps({"type": "ping"}))
+                        last_ping_at = now
             except Exception:
                 time.sleep(self.reconnect_seconds)
             finally:

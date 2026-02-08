@@ -22,6 +22,7 @@ export type NodeRecord = {
   created_at: string;
   paired_at: string | null;
   last_heartbeat_at: string | null;
+  agent_commit?: string | null;
   agent_info?: Record<string, unknown> | null;
   runtime_metrics?: RuntimeMetrics | null;
 };

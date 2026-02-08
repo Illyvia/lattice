@@ -141,6 +141,7 @@ def init_db(db_path: Path) -> None:
                 last_heartbeat_at TEXT,
                 agent_hostname TEXT,
                 agent_info_json TEXT,
+                agent_commit TEXT,
                 last_metrics_json TEXT
             );
 
@@ -162,6 +163,7 @@ def init_db(db_path: Path) -> None:
             """
         )
         _ensure_column(conn, "nodes", "last_metrics_json", "TEXT")
+        _ensure_column(conn, "nodes", "agent_commit", "TEXT")
 
 
 def _node_exists_by_name(conn: sqlite3.Connection, name: str) -> bool:
@@ -448,6 +450,11 @@ def record_heartbeat(
         hostname_value = (payload or {}).get("hostname")
         extra_value = (payload or {}).get("extra")
         usage_value = extra_value.get("usage") if isinstance(extra_value, dict) else None
+        commit_value = extra_value.get("git_commit") if isinstance(extra_value, dict) else None
+        if not isinstance(commit_value, str) or not commit_value.strip():
+            commit_value = None
+        else:
+            commit_value = commit_value.strip()
         runtime_metrics = _normalize_runtime_metrics(usage_value)
         if runtime_metrics:
             runtime_metrics["updated_at"] = last_heartbeat_at
@@ -457,10 +464,11 @@ def record_heartbeat(
             UPDATE nodes
             SET
                 last_heartbeat_at = ?,
-                last_metrics_json = COALESCE(?, last_metrics_json)
+                last_metrics_json = COALESCE(?, last_metrics_json),
+                agent_commit = COALESCE(?, agent_commit)
             WHERE id = ?;
             """,
-            (last_heartbeat_at, metrics_json, row["id"]),
+            (last_heartbeat_at, metrics_json, commit_value, row["id"]),
         )
         log_meta: dict[str, Any] = {}
         if isinstance(hostname_value, str) and hostname_value.strip():

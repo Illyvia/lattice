@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -139,11 +140,122 @@ def pair_until_success(config: AgentConfig) -> dict[str, str]:
 
 def build_heartbeat_extra() -> dict[str, Any]:
     info = get_system_info()
-    return {
+    payload = {
         "os": info["os"],
         "arch": info["arch"],
         "hardware": info["hardware"],
         "usage": get_runtime_metrics(),
+    }
+    git_commit = get_git_commit_hash()
+    if git_commit:
+        payload["git_commit"] = git_commit
+    return payload
+
+
+def _run_git_command(args: list[str]) -> tuple[int, str, str]:
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def get_git_commit_hash() -> str | None:
+    rc, stdout, _ = _run_git_command(["git", "rev-parse", "HEAD"])
+    if rc != 0:
+        return None
+    commit_hash = stdout.strip()
+    return commit_hash if commit_hash else None
+
+
+def _parse_ahead_behind(raw_counts: str) -> tuple[int, int] | None:
+    parts = raw_counts.split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def execute_agent_update(force: bool = False, branch: str | None = None) -> tuple[str, str, dict[str, Any]]:
+    branch_name = branch.strip() if isinstance(branch, str) and branch.strip() else None
+
+    rc, inside_repo, err = _run_git_command(["git", "rev-parse", "--is-inside-work-tree"])
+    if rc != 0 or inside_repo.lower() != "true":
+        return "failed", "Agent is not running from a git repository", {"stderr": err}
+
+    fetch_args = ["git", "fetch", "--all", "--prune"]
+    if branch_name:
+        fetch_args = ["git", "fetch", "origin", branch_name, "--prune"]
+    rc, _, err = _run_git_command(fetch_args)
+    if rc != 0:
+        return "failed", "git fetch failed", {"stderr": err, "branch": branch_name}
+
+    rc, before_sha, err = _run_git_command(["git", "rev-parse", "HEAD"])
+    if rc != 0:
+        return "failed", "Unable to resolve current commit", {"stderr": err}
+
+    upstream_ref: str | None = None
+    if branch_name:
+        upstream_ref = f"origin/{branch_name}"
+    else:
+        rc, upstream, err = _run_git_command(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+        )
+        if rc == 0 and upstream:
+            upstream_ref = upstream
+        elif not force:
+            return "failed", "No upstream branch configured; set one or pass branch", {"stderr": err}
+
+    ahead = 0
+    behind = 0
+    if upstream_ref:
+        rc, counts, err = _run_git_command(["git", "rev-list", "--left-right", "--count", f"HEAD...{upstream_ref}"])
+        parsed_counts = _parse_ahead_behind(counts)
+        if rc != 0 or parsed_counts is None:
+            return "failed", "Unable to compare local branch to upstream", {"stderr": err, "upstream": upstream_ref}
+        ahead, behind = parsed_counts
+        if behind == 0 and not force:
+            return "up_to_date", "Agent code is already up to date", {
+                "before": before_sha,
+                "after": before_sha,
+                "upstream": upstream_ref,
+                "ahead": ahead,
+                "behind": behind,
+            }
+
+    pull_args = ["git", "pull", "--ff-only"]
+    if branch_name:
+        pull_args = ["git", "pull", "--ff-only", "origin", branch_name]
+    rc, stdout, err = _run_git_command(pull_args)
+    if rc != 0:
+        return "failed", "git pull failed", {"stderr": err, "stdout": stdout, "branch": branch_name}
+
+    rc, after_sha, err = _run_git_command(["git", "rev-parse", "HEAD"])
+    if rc != 0:
+        return "failed", "Unable to resolve updated commit", {"stderr": err}
+
+    if after_sha != before_sha:
+        return "updated", "Agent code updated successfully", {
+            "before": before_sha,
+            "after": after_sha,
+            "upstream": upstream_ref,
+            "ahead": ahead,
+            "behind": behind,
+        }
+    return "up_to_date", "No new commit applied", {
+        "before": before_sha,
+        "after": after_sha,
+        "upstream": upstream_ref,
+        "ahead": ahead,
+        "behind": behind,
     }
 
 
@@ -178,6 +290,65 @@ def main() -> None:
 
     ws_streamer: AgentWebSocketStreamer | None = None
     ws_log_handler: WebSocketLogHandler | None = None
+    update_in_progress = threading.Event()
+
+    def handle_ws_command(command: dict[str, Any]) -> None:
+        nonlocal ws_streamer
+
+        if not isinstance(command, dict):
+            return
+
+        command_type = command.get("command_type")
+        command_id = command.get("command_id")
+        if not isinstance(command_id, str) or not command_id.strip():
+            command_id = "unknown"
+
+        if command_type != "update_agent":
+            log.info(f"Ignoring unsupported command type={command_type}")
+            if ws_streamer:
+                ws_streamer.send_command_result(
+                    command_id=command_id,
+                    command_type=str(command_type),
+                    status="failed",
+                    message=f"Unsupported command type: {command_type}",
+                )
+            return
+
+        if update_in_progress.is_set():
+            message = "Update already in progress"
+            log.info(message)
+            if ws_streamer:
+                ws_streamer.send_command_result(
+                    command_id=command_id,
+                    command_type="update_agent",
+                    status="busy",
+                    message=message,
+                )
+            return
+
+        update_in_progress.set()
+        try:
+            force = bool(command.get("force", False))
+            branch = command.get("branch") if isinstance(command.get("branch"), str) else None
+            log.info(
+                f"Received update command command_id={command_id} force={force} branch={branch or 'upstream'}"
+            )
+            status, message, details = execute_agent_update(force=force, branch=branch)
+            if status == "failed":
+                log.info(f"Agent update failed command_id={command_id} details={details}")
+            else:
+                log.info(f"Agent update {status} command_id={command_id} details={details}")
+
+            if ws_streamer:
+                ws_streamer.send_command_result(
+                    command_id=command_id,
+                    command_type="update_agent",
+                    status=status,
+                    message=message,
+                    details=details,
+                )
+        finally:
+            update_in_progress.clear()
 
     def start_ws_streamer(current_state: dict[str, str]) -> None:
         nonlocal ws_streamer, ws_log_handler
@@ -192,6 +363,7 @@ def main() -> None:
             master_url=config.master_url,
             node_id=current_state["node_id"],
             pair_token=current_state["pair_token"],
+            command_handler=handle_ws_command,
         )
         ws_streamer.start()
         ws_log_handler = WebSocketLogHandler(ws_streamer)

@@ -3,6 +3,7 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import type { IconProp } from "@fortawesome/fontawesome-svg-core";
 import {
   faArrowLeft,
+  faArrowsRotate,
   faPenToSquare,
   faRotateRight,
   faTrashCan
@@ -11,12 +12,14 @@ import { faApple, faLinux, faWindows } from "@fortawesome/free-brands-svg-icons"
 import { useNavigate, useParams } from "react-router-dom";
 import { NodeLogRecord, NodeRecord, RuntimeMetrics } from "../types";
 import { formatTimestamp, getHeartbeatHealth } from "../utils/health";
+import { toast } from "react-toastify";
 
 type NodeDetailPageProps = {
   nodes: NodeRecord[];
   apiBaseUrl: string;
   onDeleteNode: (nodeId: string) => Promise<void>;
   onRenameNode: (nodeId: string, name: string) => Promise<void>;
+  onUpdateNode: (nodeId: string) => Promise<void>;
 };
 
 type NodeLogsResponse = {
@@ -115,6 +118,14 @@ function formatBytes(value: number | null): string {
   return `${bytes.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
+function shortCommitHash(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length <= 12) {
+    return normalized;
+  }
+  return normalized.slice(0, 12);
+}
+
 function usageDetail(usedBytes: number | null, totalBytes: number | null): string {
   if (usedBytes === null || totalBytes === null || totalBytes <= 0) {
     return "-";
@@ -168,7 +179,8 @@ export default function NodeDetailPage({
   nodes,
   apiBaseUrl,
   onDeleteNode,
-  onRenameNode
+  onRenameNode,
+  onUpdateNode
 }: NodeDetailPageProps) {
   const navigate = useNavigate();
   const { nodeId } = useParams();
@@ -183,6 +195,8 @@ export default function NodeDetailPage({
   const [renameValue, setRenameValue] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
+  const [updating, setUpdating] = useState(false);
+  const [confirmUpdateOpen, setConfirmUpdateOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -211,6 +225,12 @@ export default function NodeDetailPage({
     setUsePolling(false);
     setStreamConnected(false);
   }, [node?.id]);
+
+  useEffect(() => {
+    if (logsError) {
+      toast.error(logsError);
+    }
+  }, [logsError]);
 
   useEffect(() => {
     const currentNodeId = node?.id;
@@ -458,6 +478,10 @@ export default function NodeDetailPage({
   const metrics: RuntimeMetrics | null = node.runtime_metrics ?? null;
   const agentOs = getAgentOs(node.agent_info);
   const agentOsIcon = getOsIcon(agentOs);
+  const agentCommit =
+    typeof node.agent_commit === "string" && node.agent_commit.trim()
+      ? node.agent_commit.trim()
+      : null;
   const cpuPercent = percentValue(metrics?.cpu_percent);
   const memoryPercent = percentValue(metrics?.memory_percent);
   const storagePercent = percentValue(metrics?.storage_percent);
@@ -499,6 +523,20 @@ export default function NodeDetailPage({
     }
   }
 
+  async function triggerUpdate() {
+    if (!node) {
+      return;
+    }
+    setUpdating(true);
+    try {
+      await onUpdateNode(node.id);
+    } catch {
+      // App layer already surfaces toast/error state.
+    } finally {
+      setUpdating(false);
+    }
+  }
+
   return (
     <section>
       <h2 className="node-page-heading">{node.name}</h2>
@@ -518,6 +556,15 @@ export default function NodeDetailPage({
         >
           <FontAwesomeIcon icon={faPenToSquare} />
           <span>Rename</span>
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={updating || node.state !== "paired"}
+          onClick={() => setConfirmUpdateOpen(true)}
+        >
+          <FontAwesomeIcon icon={faArrowsRotate} />
+          <span>{updating ? "Updating..." : "Update Agent"}</span>
         </button>
         <button
           type="button"
@@ -545,6 +592,10 @@ export default function NodeDetailPage({
           </div>
           <p className="muted node-detail-subtitle">
             id: <code>{node.id}</code>
+          </p>
+          <p className="muted node-detail-subtitle">
+            commit:{" "}
+            {agentCommit ? <code title={agentCommit}>{shortCommitHash(agentCommit)}</code> : "Unknown"}
           </p>
           <p className="muted node-detail-subtitle os-row">
             {agentOs ?? "Unknown OS"}
@@ -646,6 +697,52 @@ export default function NodeDetailPage({
           ) : null}
         </div>
       </section>
+
+      {confirmUpdateOpen ? (
+        <div
+          className="modal-overlay"
+          onClick={() => {
+            if (!updating) {
+              setConfirmUpdateOpen(false);
+            }
+          }}
+        >
+          <div
+            className="modal-card"
+            onClick={(event) => {
+              event.stopPropagation();
+            }}
+          >
+            <h2>Update Agent</h2>
+            <p className="muted">
+              This will update and restart the agent service running on this node. Would you like to
+              continue?
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={updating}
+                onClick={() => {
+                  setConfirmUpdateOpen(false);
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={updating}
+                onClick={async () => {
+                  await triggerUpdate();
+                  setConfirmUpdateOpen(false);
+                }}
+              >
+                {updating ? "Updating..." : "Continue"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {renameOpen ? (
         <div

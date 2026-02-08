@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import HomePage from "./pages/HomePage";
@@ -6,7 +6,8 @@ import NewNodePage from "./pages/NewNodePage";
 import NodeDetailPage from "./pages/NodeDetailPage";
 import NodesPage from "./pages/NodesPage";
 import { NodeRecord, ThemeMode } from "./types";
-import { getHeartbeatHealth } from "./utils/health";
+import { ToastContainer, toast } from "react-toastify";
+import "react-toastify/dist/ReactToastify.css";
 
 const configuredApiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
 const defaultApiBaseUrl =
@@ -24,6 +25,12 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<string>("-");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return window.localStorage.getItem("lattice-sidebar-collapsed") === "1";
+  });
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") {
       return "light";
@@ -50,6 +57,7 @@ export default function App() {
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load nodes");
+      toast.error(err instanceof Error ? err.message : "Failed to load nodes");
     }
   }, []);
 
@@ -63,6 +71,10 @@ export default function App() {
     document.documentElement.setAttribute("data-theme", theme);
     window.localStorage.setItem("lattice-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem("lattice-sidebar-collapsed", sidebarCollapsed ? "1" : "0");
+  }, [sidebarCollapsed]);
 
   async function onCreateNode(name: string | null) {
     setLoading(true);
@@ -80,9 +92,11 @@ export default function App() {
       }
       await loadNodes();
       setError(null);
+      toast.success("Node created");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to create node";
       setError(message);
+      toast.error(message);
       throw new Error(message);
     } finally {
       setLoading(false);
@@ -104,6 +118,7 @@ export default function App() {
         navigate("/nodes");
       }
       await loadNodes();
+      toast.success("Node deleted");
       return;
     }
 
@@ -133,14 +148,17 @@ export default function App() {
           navigate("/nodes");
         }
         await loadNodes();
+        toast.success("Node deleted");
         return;
       }
 
       const errorSource = bodyDeleteResp ?? fallbackResp ?? firstResp;
       if (errorSource) {
         const body = await errorSource.json().catch(() => ({}));
+        toast.error(body.error ?? `Failed to delete node (${errorSource.status})`);
         throw new Error(body.error ?? `Failed to delete node (${errorSource.status})`);
       }
+      toast.error("Failed to delete node (network error)");
       throw new Error("Failed to delete node (network error)");
     }
 
@@ -148,6 +166,7 @@ export default function App() {
       navigate("/nodes");
     }
     await loadNodes();
+    toast.success("Node deleted");
   }
 
   async function onRenameNode(nodeId: string, name: string) {
@@ -183,35 +202,39 @@ export default function App() {
         const errorSource = fallbackResp ?? primaryResp;
         if (errorSource) {
           const body = await errorSource.json().catch(() => ({}));
+          toast.error(body.error ?? `Failed to rename node (${errorSource.status})`);
           throw new Error(body.error ?? `Failed to rename node (${errorSource.status})`);
         }
+        toast.error("Failed to rename node (network error)");
         throw new Error("Failed to rename node (network error)");
       }
     }
 
     await loadNodes();
+    toast.success("Node renamed");
   }
 
-  const pendingCount = useMemo(
-    () => nodes.filter((node) => node.state === "pending").length,
-    [nodes]
-  );
-  const pairedCount = useMemo(
-    () => nodes.filter((node) => node.state === "paired").length,
-    [nodes]
-  );
-  const healthyCount = useMemo(
-    () => nodes.filter((node) => getHeartbeatHealth(node) === "healthy").length,
-    [nodes]
-  );
-  const degradedCount = useMemo(
-    () => nodes.filter((node) => getHeartbeatHealth(node) === "degraded").length,
-    [nodes]
-  );
-  const downCount = useMemo(
-    () => nodes.filter((node) => getHeartbeatHealth(node) === "down").length,
-    [nodes]
-  );
+  async function onUpdateNode(nodeId: string) {
+    const resp = await fetch(apiUrl(`/api/nodes/${nodeId}/actions/update-agent`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      const message = body.error ?? `Failed to queue agent update (${resp.status})`;
+      toast.error(message);
+      throw new Error(message);
+    }
+
+    const body = (await resp.json()) as { agent_connected?: boolean };
+    if (body.agent_connected === false) {
+      toast.info("Update queued. It will run when the node reconnects.");
+    } else {
+      toast.info("Update command sent to node.");
+    }
+  }
 
   const pageTitle = location.pathname.startsWith("/node/")
     ? null
@@ -222,9 +245,11 @@ export default function App() {
       : "Home";
 
   return (
-    <main className="layout">
+    <main className={`layout ${sidebarCollapsed ? "layout-sidebar-collapsed" : ""}`}>
       <Sidebar
         theme={theme}
+        collapsed={sidebarCollapsed}
+        onToggleCollapsed={() => setSidebarCollapsed((value) => !value)}
         onToggleTheme={() => setTheme(theme === "light" ? "dark" : "light")}
       />
 
@@ -239,12 +264,8 @@ export default function App() {
             element={
               <HomePage
                 lastRefresh={lastRefresh}
-                total={nodes.length}
-                pending={pendingCount}
-                paired={pairedCount}
-                healthy={healthyCount}
-                degraded={degradedCount}
-                down={downCount}
+                nodes={nodes}
+                onSelectNode={(nodeId) => navigate(`/node/${nodeId}`)}
               />
             }
           />
@@ -257,6 +278,7 @@ export default function App() {
                 onCreateNodeClick={() => navigate("/nodes/new")}
                 onDeleteNode={onDeleteNode}
                 onRenameNode={onRenameNode}
+                onUpdateNode={onUpdateNode}
                 onSelectNode={(nodeId) => navigate(`/node/${nodeId}`)}
               />
             }
@@ -282,12 +304,22 @@ export default function App() {
                 apiBaseUrl={API_BASE_URL}
                 onDeleteNode={onDeleteNode}
                 onRenameNode={onRenameNode}
+                onUpdateNode={onUpdateNode}
               />
             }
           />
           <Route path="*" element={<Navigate to="/home" replace />} />
         </Routes>
       </section>
+
+      <ToastContainer
+        position="bottom-right"
+        autoClose={4200}
+        newestOnTop
+        closeOnClick
+        pauseOnHover
+        theme={theme}
+      />
     </main>
   );
 }

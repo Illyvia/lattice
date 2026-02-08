@@ -3,6 +3,9 @@ import json
 import os
 import socket
 import sys
+import threading
+import uuid
+from datetime import datetime, timezone
 from time import sleep
 from typing import Any
 from urllib.parse import parse_qs
@@ -59,6 +62,44 @@ init_db(DB_PATH)
 
 app = Flask(__name__)
 sock = Sock(app)
+
+AGENT_COMMANDS_LOCK = threading.Lock()
+PENDING_AGENT_COMMANDS: dict[str, list[dict[str, Any]]] = {}
+CONNECTED_AGENT_NODES: set[str] = set()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _enqueue_agent_command(node_id: str, command: dict[str, Any]) -> None:
+    with AGENT_COMMANDS_LOCK:
+        queue = PENDING_AGENT_COMMANDS.setdefault(node_id, [])
+        queue.append(command)
+
+
+def _dequeue_agent_command(node_id: str) -> dict[str, Any] | None:
+    with AGENT_COMMANDS_LOCK:
+        queue = PENDING_AGENT_COMMANDS.get(node_id)
+        if not queue:
+            return None
+        command = queue.pop(0)
+        if not queue:
+            PENDING_AGENT_COMMANDS.pop(node_id, None)
+        return command
+
+
+def _set_agent_connected(node_id: str, connected: bool) -> None:
+    with AGENT_COMMANDS_LOCK:
+        if connected:
+            CONNECTED_AGENT_NODES.add(node_id)
+        else:
+            CONNECTED_AGENT_NODES.discard(node_id)
+
+
+def _is_agent_connected(node_id: str) -> bool:
+    with AGENT_COMMANDS_LOCK:
+        return node_id in CONNECTED_AGENT_NODES
 
 
 def _apply_cors_headers(response):
@@ -259,6 +300,49 @@ def post_heartbeat():
     return jsonify({"ok": True}), 200
 
 
+@app.post("/api/nodes/<node_id>/actions/update-agent")
+def post_update_agent(node_id: str):
+    payload = request.get_json(silent=True) or {}
+    force = payload.get("force", False)
+    branch = payload.get("branch")
+
+    if not isinstance(force, bool):
+        return _json_error(400, "force must be a boolean")
+    if branch is not None and not isinstance(branch, str):
+        return _json_error(400, "branch must be a string")
+
+    node = next((item for item in list_nodes(DB_PATH) if item["id"] == node_id), None)
+    if not node:
+        return _json_error(404, "node not found")
+    if node.get("state") != "paired":
+        return _json_error(409, "node must be paired before updating")
+
+    command_id = str(uuid.uuid4())
+    command: dict[str, Any] = {
+        "type": "command",
+        "command_type": "update_agent",
+        "command_id": command_id,
+        "created_at": _utc_now(),
+        "force": force,
+    }
+    if isinstance(branch, str) and branch.strip():
+        command["branch"] = branch.strip()
+
+    _enqueue_agent_command(node_id, command)
+    append_node_log(
+        DB_PATH,
+        node_id=node_id,
+        level="info",
+        message="Agent update requested from UI",
+        meta={"command_id": command_id, "force": force, "branch": command.get("branch")},
+    )
+    connected = _is_agent_connected(node_id)
+    log.info(
+        f"Queued update command node_id={node_id} command_id={command_id} connected={connected}"
+    )
+    return jsonify({"ok": True, "command_id": command_id, "queued": True, "agent_connected": connected}), 202
+
+
 def _stream_node_logs_ws(ws, node_id: str, limit: int):
     clean_node_id = (node_id or "").strip()
     if not clean_node_id:
@@ -335,8 +419,24 @@ def ws_agent(ws):
     def send_message(payload: dict[str, Any]) -> None:
         ws.send(json.dumps(payload))
 
+    def send_pending_command() -> None:
+        if not authenticated or not node_id:
+            return
+        command = _dequeue_agent_command(node_id)
+        if not command:
+            return
+        send_message(command)
+        append_node_log(
+            DB_PATH,
+            node_id=node_id,
+            level="info",
+            message=f"Sent agent command {command.get('command_type', 'unknown')}",
+            meta={"command_id": command.get("command_id"), "command": command},
+        )
+
     try:
         while True:
+            send_pending_command()
             raw = ws.receive()
             if raw is None:
                 break
@@ -381,6 +481,7 @@ def ws_agent(ws):
                 node_id = candidate_node_id.strip()
                 pair_token = candidate_pair_token.strip()
                 authenticated = True
+                _set_agent_connected(node_id, True)
                 append_node_log(
                     DB_PATH,
                     node_id=node_id,
@@ -442,6 +543,49 @@ def ws_agent(ws):
                     break
                 continue
 
+            if message_type == "command_result":
+                command_id = payload.get("command_id")
+                command_type = payload.get("command_type")
+                status = payload.get("status")
+                message = payload.get("message")
+                details = payload.get("details")
+
+                if not isinstance(command_id, str) or not command_id.strip():
+                    send_message({"type": "error", "error": "command_id is required"})
+                    continue
+                if not isinstance(command_type, str) or not command_type.strip():
+                    command_type = "unknown"
+                if not isinstance(status, str) or not status.strip():
+                    status = "unknown"
+                if not isinstance(message, str) or not message.strip():
+                    message = "No details provided"
+                if not isinstance(details, dict):
+                    details = None
+
+                level = "info"
+                if status in {"failed", "error"}:
+                    level = "error"
+                elif status in {"busy"}:
+                    level = "warning"
+
+                append_node_log(
+                    DB_PATH,
+                    node_id=node_id or "",
+                    level=level,
+                    message=f"Agent command {command_type} -> {status}: {message}",
+                    meta={
+                        "command_id": command_id,
+                        "command_type": command_type,
+                        "status": status,
+                        "details": details,
+                    },
+                )
+                log.info(
+                    f"Agent command result node_id={node_id} command_id={command_id} "
+                    f"type={command_type} status={status} message={message}"
+                )
+                continue
+
             if message_type == "ping":
                 send_message({"type": "pong"})
                 continue
@@ -451,6 +595,7 @@ def ws_agent(ws):
         log.info(f"Agent websocket closed with error node_id={node_id} details={exc}")
     finally:
         if authenticated and node_id:
+            _set_agent_connected(node_id, False)
             append_node_log(
                 DB_PATH,
                 node_id=node_id,

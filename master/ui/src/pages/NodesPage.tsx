@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
-import { faEllipsisVertical, faPenToSquare, faTrashCan } from "@fortawesome/free-solid-svg-icons";
+import {
+  faArrowsRotate,
+  faEllipsisVertical,
+  faPenToSquare,
+  faTrashCan
+} from "@fortawesome/free-solid-svg-icons";
 import { NodeRecord } from "../types";
 import { formatTimestamp, getHeartbeatHealth } from "../utils/health";
 
@@ -10,6 +15,7 @@ type NodesPageProps = {
   onCreateNodeClick: () => void;
   onDeleteNode: (nodeId: string) => Promise<void>;
   onRenameNode: (nodeId: string, name: string) => Promise<void>;
+  onUpdateNode: (nodeId: string) => Promise<void>;
   onSelectNode: (nodeId: string) => void;
 };
 
@@ -19,6 +25,7 @@ export default function NodesPage({
   onCreateNodeClick,
   onDeleteNode,
   onRenameNode,
+  onUpdateNode,
   onSelectNode
 }: NodesPageProps) {
   const [menuNodeId, setMenuNodeId] = useState<string | null>(null);
@@ -30,6 +37,8 @@ export default function NodesPage({
   const [confirmDeleteNode, setConfirmDeleteNode] = useState<NodeRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [updatingNodeId, setUpdatingNodeId] = useState<string | null>(null);
+  const [confirmUpdateNode, setConfirmUpdateNode] = useState<NodeRecord | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -104,6 +113,8 @@ export default function NodesPage({
     }
   }
 
+  const selectedMenuNode = menuNodeId ? nodes.find((item) => item.id === menuNodeId) ?? null : null;
+
   return (
     <section>
       <p className="muted">View and manage your nodes.</p>
@@ -164,7 +175,7 @@ export default function NodesPage({
                         const trigger = event.currentTarget;
                         const rect = trigger.getBoundingClientRect();
                         const menuWidth = 156;
-                        const menuHeight = 96;
+                        const menuHeight = 136;
                         const offset = 6;
                         const left = Math.max(
                           8,
@@ -223,6 +234,21 @@ export default function NodesPage({
           </button>
           <button
             type="button"
+            className="dropdown-item"
+            disabled={updatingNodeId === menuNodeId || selectedMenuNode?.state !== "paired"}
+            onClick={() => {
+              if (selectedMenuNode?.state === "paired") {
+                setConfirmUpdateNode(selectedMenuNode);
+              }
+              setMenuNodeId(null);
+              setMenuPosition(null);
+            }}
+          >
+            <FontAwesomeIcon icon={faArrowsRotate} />
+            <span>{updatingNodeId === menuNodeId ? "Updating..." : "Update Agent"}</span>
+          </button>
+          <button
+            type="button"
             className="dropdown-item dropdown-item-danger"
             onClick={() => {
               const node = nodes.find((item) => item.id === menuNodeId);
@@ -237,6 +263,57 @@ export default function NodesPage({
             <FontAwesomeIcon icon={faTrashCan} />
             <span>Delete</span>
           </button>
+        </div>
+      ) : null}
+
+      {confirmUpdateNode ? (
+        <div
+          className="modal-overlay"
+          onClick={() => {
+            if (!updatingNodeId) {
+              setConfirmUpdateNode(null);
+            }
+          }}
+        >
+          <div
+            className="modal-card"
+            onClick={(event) => {
+              event.stopPropagation();
+            }}
+          >
+            <h2>Update Agent</h2>
+            <p className="muted">
+              This will update and restart the agent service running on{" "}
+              <strong>{confirmUpdateNode.name}</strong>. Would you like to continue?
+            </p>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={updatingNodeId === confirmUpdateNode.id}
+                onClick={() => setConfirmUpdateNode(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={updatingNodeId === confirmUpdateNode.id}
+                onClick={async () => {
+                  try {
+                    setUpdatingNodeId(confirmUpdateNode.id);
+                    await onUpdateNode(confirmUpdateNode.id);
+                  } catch {
+                    // App layer already surfaces toast/error state.
+                  } finally {
+                    setUpdatingNodeId(null);
+                    setConfirmUpdateNode(null);
+                  }
+                }}
+              >
+                {updatingNodeId === confirmUpdateNode.id ? "Updating..." : "Continue"}
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
