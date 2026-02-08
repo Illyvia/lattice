@@ -172,6 +172,29 @@ def _resolve_osinfo_value(image: dict[str, Any]) -> str:
     return "detect=on,require=off"
 
 
+def _normalize_arch(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if raw in {"x86_64", "amd64", "x64"}:
+        return "amd64"
+    if raw in {"aarch64", "arm64"}:
+        return "arm64"
+    return raw
+
+
+def _resolve_image_architecture(image: dict[str, Any]) -> str:
+    declared = _normalize_arch(str(image.get("architecture", "")).strip())
+    if declared:
+        return declared
+    source_url = str(image.get("source_url", "")).strip().lower()
+    name = str(image.get("name", "")).strip().lower()
+    combined = f"{source_url} {name}"
+    if any(token in combined for token in {"amd64", "x86_64"}):
+        return "amd64"
+    if any(token in combined for token in {"arm64", "aarch64"}):
+        return "arm64"
+    return ""
+
+
 def _domain_state(domain_name: str) -> str:
     rc, stdout, _ = _run_sudo(["virsh", "domstate", domain_name], timeout_seconds=30)
     if rc != 0:
@@ -529,6 +552,16 @@ def _create_vm(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     guest_password = str(guest.get("password", "")).strip()
     if not guest_username or not guest_password:
         return "failed", "Guest credentials are required", {}
+
+    host_arch = _normalize_arch(platform.machine())
+    image_arch = _resolve_image_architecture(image)
+    if host_arch and image_arch and host_arch != image_arch:
+        return (
+            "failed",
+            f"Image architecture '{image_arch}' is incompatible with node architecture '{host_arch}'. "
+            f"Choose a '{host_arch}' cloud image.",
+            {"host_architecture": host_arch, "image_architecture": image_arch},
+        )
 
     vm_dir = VM_ROOT / vm_id
     disk_path = vm_dir / "disk.qcow2"

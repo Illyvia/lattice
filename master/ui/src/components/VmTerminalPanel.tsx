@@ -3,7 +3,6 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faPlug, faRotateRight, faTerminal } from "@fortawesome/free-solid-svg-icons";
 import { toast } from "react-toastify";
 import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 
 type VmTerminalPanelProps = {
@@ -20,8 +19,8 @@ type TerminalWireMessage =
   | { type: "terminal_error"; session_id?: string; error: string }
   | { type: "pong" };
 
-const DEFAULT_COLS = 110;
-const DEFAULT_ROWS = 28;
+const DEFAULT_COLS = 80;
+const DEFAULT_ROWS = 25;
 
 function buildTerminalWsUrl(
   apiBaseUrl: string,
@@ -54,7 +53,6 @@ function isFatalVmTerminalError(detail: string): boolean {
 export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: VmTerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -100,15 +98,9 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
               selectionBackground: "#cbd5e1",
             },
     });
-    const fitAddon = new FitAddon();
-    terminal.loadAddon(fitAddon);
     terminal.open(mount);
-    fitAddon.fit();
-    terminal.write("\u001b[1;34mLattice VM Console\u001b[0m\r\n");
-    terminal.write(`Connecting to ${vmName}...\r\n`);
 
     terminalRef.current = terminal;
-    fitAddonRef.current = fitAddon;
 
     const observer = new MutationObserver(() => {
       const activeTheme = readThemeMode();
@@ -140,14 +132,12 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       socketRef.current = null;
       terminalRef.current?.dispose();
       terminalRef.current = null;
-      fitAddonRef.current = null;
     };
   }, [vmName]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
-    const fitAddon = fitAddonRef.current;
-    if (!terminal || !fitAddon) {
+    if (!terminal) {
       return;
     }
 
@@ -176,31 +166,18 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       socket.send(JSON.stringify({ type: "input", data }));
     });
 
-    const onResize = () => {
-      if (!terminalRef.current || !fitAddonRef.current) {
-        return;
-      }
-      fitAddonRef.current.fit();
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(
-          JSON.stringify({
-            type: "resize",
-            cols: terminalRef.current.cols,
-            rows: terminalRef.current.rows,
-          })
-        );
-      }
-    };
-    window.addEventListener("resize", onResize);
-
     socket.onopen = () => {
       didOpen = true;
       setConnecting(false);
       setConnected(true);
       reconnectAttemptsRef.current = 0;
-      onResize();
-      terminal.writeln("");
-      terminal.writeln("\u001b[32mConnected.\u001b[0m");
+      socket.send(
+        JSON.stringify({
+          type: "resize",
+          cols: DEFAULT_COLS,
+          rows: DEFAULT_ROWS,
+        })
+      );
     };
 
     socket.onmessage = (event) => {
@@ -235,28 +212,25 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       }
       if (message.type === "terminal_exit") {
         const code = typeof message.exit_code === "number" ? message.exit_code : 0;
-        terminalInstance.writeln(`\r\n\u001b[33m[process exited: ${code}]\u001b[0m`);
+        toast.info(`VM console closed (exit ${code})`);
         return;
       }
       if (message.type === "terminal_error") {
         const detail = message.error || "terminal error";
         if (detail === "agent_not_connected" || detail.toLowerCase().includes("agent websocket disconnected")) {
           sawAgentNotConnected = true;
-          terminalInstance.writeln("\r\n\u001b[33m[waiting for agent websocket connection...]\u001b[0m");
           return;
         }
         if (isFatalVmTerminalError(detail)) {
           disableAutoReconnectRef.current = true;
         }
-        terminalInstance.writeln(`\r\n\u001b[31m[terminal error] ${detail}\u001b[0m`);
         toast.error(`VM terminal error: ${detail}`);
       }
     };
 
     socket.onerror = () => {
-      const terminalInstance = terminalRef.current;
-      if (terminalInstance && !sawAgentNotConnected && !closedByClient) {
-        terminalInstance.writeln("\r\n\u001b[31m[connection error]\u001b[0m");
+      if (!sawAgentNotConnected && !closedByClient) {
+        toast.error("VM terminal connection error");
       }
     };
 
@@ -273,10 +247,6 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       const nextAttempt = Math.min(reconnectAttemptsRef.current + 1, 8);
       reconnectAttemptsRef.current = nextAttempt;
       const delayMs = Math.min(1000 * 2 ** (nextAttempt - 1), 10000);
-      const terminalInstance = terminalRef.current;
-      if (terminalInstance) {
-        terminalInstance.writeln(`\u001b[90m[reconnecting in ${Math.round(delayMs / 1000)}s]\u001b[0m`);
-      }
       reconnectTimerRef.current = window.setTimeout(() => {
         reconnectTimerRef.current = null;
         reconnectScheduledRef.current = false;
@@ -286,28 +256,24 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       }, delayMs);
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event: CloseEvent) => {
       setConnecting(false);
       setConnected(false);
       setSessionId(null);
-      const terminalInstance = terminalRef.current;
-      if (terminalInstance) {
-        if (!closedByClient || didOpen) {
-          terminalInstance.writeln("");
-          terminalInstance.writeln(
-            closedByClient
-              ? "\u001b[90m[terminal disconnected]\u001b[0m"
-              : "\u001b[31m[terminal connection closed]\u001b[0m"
-          );
-        }
+      // Avoid injecting status text into the VM console stream.
+      // Full-screen firmware/installer UIs can render incorrectly if mixed.
+      if (!closedByClient && didOpen) {
+        toast.info("VM terminal disconnected");
       }
-      scheduleReconnect();
+      // A clean close (1000) is usually intentional; don't reconnect-loop.
+      if (!closedByClient && !disableAutoReconnectRef.current && event.code !== 1000) {
+        scheduleReconnect();
+      }
     };
 
     return () => {
       isDisposed = true;
       onDataDisposable.dispose();
-      window.removeEventListener("resize", onResize);
       closedByClient = true;
       reconnectScheduledRef.current = false;
       if (reconnectTimerRef.current !== null) {

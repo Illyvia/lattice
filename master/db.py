@@ -136,36 +136,52 @@ def _normalize_runtime_metrics(value: Any) -> dict[str, Any] | None:
 
 
 def _seed_vm_images(conn: sqlite3.Connection) -> None:
-    row = conn.execute("SELECT COUNT(*) AS count FROM vm_images;").fetchone()
-    if row and int(row["count"] or 0) > 0:
-        return
-
     created_at = utc_now()
     defaults = [
         {
             "id": "ubuntu-24-04",
-            "name": "Ubuntu 24.04 LTS",
+            "name": "Ubuntu 24.04 LTS (amd64)",
             "os_family": "linux",
             "source_url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
             "sha256": None,
             "default_username": "ubuntu",
+            "architecture": "amd64",
         },
         {
             "id": "debian-12",
-            "name": "Debian 12",
+            "name": "Debian 12 (amd64)",
             "os_family": "linux",
             "source_url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
             "sha256": None,
             "default_username": "debian",
+            "architecture": "amd64",
+        },
+        {
+            "id": "ubuntu-24-04-arm64",
+            "name": "Ubuntu 24.04 LTS (arm64)",
+            "os_family": "linux",
+            "source_url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img",
+            "sha256": None,
+            "default_username": "ubuntu",
+            "architecture": "arm64",
+        },
+        {
+            "id": "debian-12-arm64",
+            "name": "Debian 12 (arm64)",
+            "os_family": "linux",
+            "source_url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2",
+            "sha256": None,
+            "default_username": "debian",
+            "architecture": "arm64",
         },
     ]
     for image in defaults:
         conn.execute(
             """
-            INSERT INTO vm_images (
+            INSERT OR IGNORE INTO vm_images (
                 id, name, os_family, source_url, sha256,
-                default_username, cloud_init_enabled, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?);
+                default_username, cloud_init_enabled, created_at, architecture
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?);
             """,
             (
                 image["id"],
@@ -175,7 +191,16 @@ def _seed_vm_images(conn: sqlite3.Connection) -> None:
                 image["sha256"],
                 image["default_username"],
                 created_at,
+                image["architecture"],
             ),
+        )
+        conn.execute(
+            """
+            UPDATE vm_images
+            SET architecture = COALESCE(NULLIF(architecture, ''), ?)
+            WHERE id = ?;
+            """,
+            (image["architecture"], image["id"]),
         )
 
 
@@ -224,7 +249,8 @@ def init_db(db_path: Path) -> None:
                 sha256 TEXT,
                 default_username TEXT NOT NULL,
                 cloud_init_enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                architecture TEXT
             );
 
             CREATE TABLE IF NOT EXISTS node_vms (
@@ -294,6 +320,7 @@ def init_db(db_path: Path) -> None:
         _ensure_column(conn, "nodes", "last_metrics_json", "TEXT")
         _ensure_column(conn, "nodes", "agent_commit", "TEXT")
         _ensure_column(conn, "nodes", "capabilities_json", "TEXT")
+        _ensure_column(conn, "vm_images", "architecture", "TEXT")
         _seed_vm_images(conn)
 
 
@@ -736,7 +763,7 @@ def list_vm_images(db_path: Path) -> list[dict[str, Any]]:
     with _connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT id, name, os_family, source_url, sha256, default_username, cloud_init_enabled, created_at
+            SELECT id, name, os_family, source_url, sha256, default_username, cloud_init_enabled, created_at, architecture
             FROM vm_images
             ORDER BY name ASC;
             """
@@ -1036,6 +1063,7 @@ def create_vm_request(
                     "source_url": image_row["source_url"],
                     "sha256": image_row["sha256"],
                     "default_username": image_row["default_username"],
+                    "architecture": image_row["architecture"],
                 },
                 "guest": {
                     "username": normalized["guest_username"],
