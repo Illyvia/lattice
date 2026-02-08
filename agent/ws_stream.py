@@ -54,18 +54,6 @@ def _resolve_ws_factory() -> tuple[Callable[[str, float], Any] | None, tuple[typ
 
         return _factory, _resolve_timeout_exception(timeout_exc_core), module_path
 
-    websocket_class = getattr(websocket, "WebSocket", None)
-    if callable(websocket_class):
-        def _factory(url: str, timeout_seconds: float) -> Any:
-            ws = websocket_class()
-            set_timeout = getattr(ws, "settimeout", None)
-            if callable(set_timeout):
-                set_timeout(timeout_seconds)
-            ws.connect(url)
-            return ws
-
-        return _factory, _resolve_timeout_exception(timeout_exc), module_path
-
     return None, _resolve_timeout_exception(timeout_exc), module_path
 
 
@@ -204,8 +192,10 @@ class AgentWebSocketStreamer:
         ws_factory, timeout_exceptions, ws_module_path = _resolve_ws_factory()
         if ws_factory is None:
             self._log_status(
-                "Agent websocket unavailable: no compatible client API found in module "
-                f"'websocket' ({ws_module_path}). Install websocket-client and remove websocket."
+                "Agent websocket unavailable: loaded incompatible websocket module at "
+                f"{ws_module_path}. Install websocket-client and remove websocket. "
+                "Run: python3 -m pip uninstall -y websocket && "
+                "python3 -m pip install --upgrade websocket-client"
             )
             while not self._stop_event.is_set():
                 time.sleep(self.reconnect_seconds)
