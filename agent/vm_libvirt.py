@@ -16,6 +16,8 @@ IMAGE_ROOT = Path("/var/lib/lattice/vm-images")
 _IPV4_REGEX = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
 _CAPABILITY_LOCK = threading.Lock()
 _CAPABILITY_CACHE: dict[str, Any] = {"checked_at": 0.0, "value": None}
+_AUTO_INSTALL_LOCK = threading.Lock()
+_AUTO_INSTALL_STATE: dict[str, Any] = {"last_attempt": 0.0}
 
 
 def _run(cmd: list[str], timeout_seconds: int = 120) -> tuple[int, str, str]:
@@ -112,6 +114,176 @@ def _detect_capability() -> dict[str, Any]:
         "missing_tools": [],
         "managed_paths": [str(IMAGE_ROOT), str(VM_ROOT)],
     }
+
+
+def _refresh_capability_cache(value: dict[str, Any]) -> None:
+    with _CAPABILITY_LOCK:
+        _CAPABILITY_CACHE["checked_at"] = time.monotonic()
+        _CAPABILITY_CACHE["value"] = dict(value)
+
+
+def _detect_linux_package_manager() -> str | None:
+    if shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("dnf"):
+        return "dnf"
+    if shutil.which("yum"):
+        return "yum"
+    if shutil.which("pacman"):
+        return "pacman"
+    if shutil.which("zypper"):
+        return "zypper"
+    return None
+
+
+def _install_linux_prerequisites(package_manager: str) -> tuple[bool, str, dict[str, Any]]:
+    if package_manager == "apt":
+        update_cmd = ["apt-get", "update"]
+        install_cmd = [
+            "apt-get",
+            "install",
+            "-y",
+            "qemu-kvm",
+            "libvirt-daemon-system",
+            "libvirt-clients",
+            "virtinst",
+            "cloud-image-utils",
+            "qemu-utils",
+        ]
+        rc, out, err = _run_sudo(update_cmd, timeout_seconds=1200)
+        if rc != 0:
+            return False, "apt-get update failed", {"stdout": out, "stderr": err}
+        rc, out, err = _run_sudo(install_cmd, timeout_seconds=1800)
+        if rc != 0:
+            return False, "apt-get install failed", {"stdout": out, "stderr": err}
+        # Service enable/start can fail harmlessly on some distros/images.
+        _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
+        return True, "Installed VM prerequisites with apt", {}
+
+    if package_manager == "dnf":
+        cmd = [
+            "dnf",
+            "install",
+            "-y",
+            "qemu-kvm",
+            "libvirt",
+            "virt-install",
+            "cloud-utils",
+            "qemu-img",
+        ]
+        rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
+        if rc != 0:
+            return False, "dnf install failed", {"stdout": out, "stderr": err}
+        _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
+        return True, "Installed VM prerequisites with dnf", {}
+
+    if package_manager == "yum":
+        cmd = [
+            "yum",
+            "install",
+            "-y",
+            "qemu-kvm",
+            "libvirt",
+            "virt-install",
+            "cloud-utils",
+            "qemu-img",
+        ]
+        rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
+        if rc != 0:
+            return False, "yum install failed", {"stdout": out, "stderr": err}
+        _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
+        return True, "Installed VM prerequisites with yum", {}
+
+    if package_manager == "pacman":
+        cmd = [
+            "pacman",
+            "-Sy",
+            "--noconfirm",
+            "qemu-full",
+            "libvirt",
+            "virt-install",
+            "cloud-image-utils",
+        ]
+        rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
+        if rc != 0:
+            return False, "pacman install failed", {"stdout": out, "stderr": err}
+        _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
+        return True, "Installed VM prerequisites with pacman", {}
+
+    if package_manager == "zypper":
+        cmd = [
+            "zypper",
+            "--non-interactive",
+            "install",
+            "qemu-kvm",
+            "libvirt",
+            "virt-install",
+            "cloud-utils",
+        ]
+        rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
+        if rc != 0:
+            return False, "zypper install failed", {"stdout": out, "stderr": err}
+        _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
+        return True, "Installed VM prerequisites with zypper", {}
+
+    return False, "Unsupported package manager", {"package_manager": package_manager}
+
+
+def auto_install_vm_prerequisites(force: bool = False) -> dict[str, Any]:
+    if platform.system().lower() != "linux":
+        return {"attempted": False, "ready": False, "message": "Auto-install only runs on Linux"}
+
+    with _AUTO_INSTALL_LOCK:
+        now = time.monotonic()
+        last_attempt = float(_AUTO_INSTALL_STATE.get("last_attempt", 0.0))
+        cooldown_seconds = 600
+        if not force and (now - last_attempt) < cooldown_seconds:
+            current = get_vm_capability(max_age_seconds=0)
+            return {
+                "attempted": False,
+                "ready": bool(current.get("ready")),
+                "message": "Auto-install attempt is in cooldown",
+                "capability": current,
+            }
+
+        _AUTO_INSTALL_STATE["last_attempt"] = now
+        capability = _detect_capability()
+        if capability.get("ready"):
+            _refresh_capability_cache(capability)
+            return {"attempted": False, "ready": True, "message": "Prerequisites already installed", "capability": capability}
+
+        missing_tools = capability.get("missing_tools")
+        if not isinstance(missing_tools, list) or len(missing_tools) == 0:
+            _refresh_capability_cache(capability)
+            return {
+                "attempted": False,
+                "ready": False,
+                "message": str(capability.get("message", "VM capability is not ready")),
+                "capability": capability,
+            }
+
+        package_manager = _detect_linux_package_manager()
+        if not package_manager:
+            _refresh_capability_cache(capability)
+            return {
+                "attempted": False,
+                "ready": False,
+                "message": "No supported package manager found for auto-install",
+                "capability": capability,
+            }
+
+        ok, install_message, details = _install_linux_prerequisites(package_manager)
+        refreshed = _detect_capability()
+        _refresh_capability_cache(refreshed)
+        return {
+            "attempted": True,
+            "ok": ok,
+            "ready": bool(refreshed.get("ready")),
+            "message": install_message,
+            "details": details,
+            "package_manager": package_manager,
+            "capability": refreshed,
+        }
 
 
 def get_vm_capability(max_age_seconds: int = 60) -> dict[str, Any]:
@@ -266,7 +438,14 @@ def execute_vm_command(command: dict[str, Any]) -> tuple[str, str, dict[str, Any
     try:
         capability = get_vm_capability()
         if not capability.get("ready"):
-            return "failed", str(capability.get("message", "VM capability is not ready")), {"capability": capability}
+            auto_install_result = auto_install_vm_prerequisites(force=False)
+            capability = get_vm_capability(max_age_seconds=0)
+            if not capability.get("ready"):
+                return (
+                    "failed",
+                    str(capability.get("message", "VM capability is not ready")),
+                    {"capability": capability, "auto_install": auto_install_result},
+                )
 
         command_type = str(command.get("command_type", "")).strip()
         vm_id = str(command.get("vm_id", "")).strip()

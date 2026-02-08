@@ -17,7 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from agent.config import AgentConfig, load_config
 from agent.heartbeat import HeartbeatSender
-from agent.vm_libvirt import execute_vm_command, get_vm_capability
+from agent.vm_libvirt import auto_install_vm_prerequisites, execute_vm_command, get_vm_capability
 from agent.ws_stream import AgentWebSocketStreamer
 from log_setup import setup_logger
 from agent.system import get_runtime_metrics, get_system_info, log_system_info
@@ -283,6 +283,19 @@ def main() -> None:
     except Exception as exc:
         log.info(f"Failed loading config: {exc}")
         raise SystemExit(1) from exc
+
+    def bootstrap_vm_prerequisites() -> None:
+        result = auto_install_vm_prerequisites(force=False)
+        if result.get("attempted"):
+            ready = bool(result.get("ready"))
+            log.info(
+                f"VM prerequisite auto-install attempted ready={ready} "
+                f"manager={result.get('package_manager')} message={result.get('message')}"
+            )
+        else:
+            log.info(f"VM prerequisite auto-install skipped message={result.get('message')}")
+
+    threading.Thread(target=bootstrap_vm_prerequisites, daemon=True).start()
 
     state = load_state(STATE_PATH)
     if state and state.get("node_id") and state.get("pair_token"):
