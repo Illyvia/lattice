@@ -1281,6 +1281,7 @@ def apply_vm_command_result(
         ).fetchone()
         if op_row is None:
             return "not_found", None
+        original_op_payload = dict(op_row)
 
         if clean_status == "running":
             conn.execute(
@@ -1411,4 +1412,14 @@ def apply_vm_command_result(
         )
 
         updated_op = conn.execute("SELECT * FROM vm_operations WHERE id = ? LIMIT 1;", (clean_operation_id,)).fetchone()
+        if updated_op is None:
+            # Delete success can remove node_vms row, which cascades vm_operations row.
+            # Return a synthesized operation payload so command-result handling still succeeds.
+            synthesized_operation = dict(original_op_payload)
+            synthesized_operation["status"] = final_status
+            synthesized_operation["started_at"] = original_op_payload.get("started_at") or now
+            synthesized_operation["ended_at"] = now
+            synthesized_operation["error"] = clean_message if final_status == "failed" else None
+            synthesized_operation["result_json"] = json.dumps(details_payload) if details_payload else None
+            return "ok", {"operation": _to_public_vm_operation(synthesized_operation), "vm": vm_payload}
         return "ok", {"operation": _to_public_vm_operation(updated_op), "vm": vm_payload}

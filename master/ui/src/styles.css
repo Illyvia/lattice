@@ -1309,6 +1309,20 @@ th {
   gap: 10px;
 }
 
+.vm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.vm-field-label {
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
 .vm-review {
   margin: 0;
   border: 1px solid var(--border);

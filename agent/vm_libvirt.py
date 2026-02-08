@@ -113,6 +113,45 @@ def _compute_sha256(path: Path) -> str:
     return hasher.hexdigest().lower()
 
 
+def _bridge_exists(name: str) -> bool:
+    interface = (name or "").strip()
+    if not interface:
+        return False
+    rc, _, _ = _run(["ip", "link", "show", interface], timeout_seconds=20)
+    return rc == 0
+
+
+def _ensure_libvirt_default_network() -> bool:
+    rc, stdout, _ = _run_sudo(["virsh", "net-info", "default"], timeout_seconds=30)
+    if rc != 0:
+        return False
+    lower = stdout.lower()
+    if "active: yes" in lower:
+        return True
+    _run_sudo(["virsh", "net-start", "default"], timeout_seconds=60)
+    _run_sudo(["virsh", "net-autostart", "default"], timeout_seconds=30)
+    rc, stdout, _ = _run_sudo(["virsh", "net-info", "default"], timeout_seconds=30)
+    return rc == 0 and "active: yes" in stdout.lower()
+
+
+def _resolve_network_argument(requested_bridge: str) -> tuple[str | None, str | None]:
+    bridge = (requested_bridge or "").strip() or "br0"
+    if _bridge_exists(bridge):
+        return f"bridge={bridge},model=virtio", None
+    if _ensure_libvirt_default_network():
+        return "network=default,model=virtio", f"Bridge '{bridge}' not found; using libvirt default network"
+    return None, f"Bridge '{bridge}' not found and libvirt network 'default' is unavailable"
+
+
+def _resolve_osinfo_value(image: dict[str, Any]) -> str:
+    family = str(image.get("os_family", "")).strip().lower()
+    if family == "linux":
+        return "linux2022"
+    if family == "windows":
+        return "win10"
+    return "detect=on,require=off"
+
+
 def _domain_state(domain_name: str) -> str:
     rc, stdout, _ = _run_sudo(["virsh", "domstate", domain_name], timeout_seconds=30)
     if rc != 0:
@@ -149,7 +188,7 @@ def _detect_capability() -> dict[str, Any]:
             "managed_paths": [str(IMAGE_ROOT), str(VM_ROOT)],
         }
 
-    required_tools = ["sudo", "virsh", "virt-install", "qemu-img", "cloud-localds", "install", "mkdir", "rm"]
+    required_tools = ["sudo", "ip", "virsh", "virt-install", "qemu-img", "cloud-localds", "install", "mkdir", "rm"]
     missing_tools = [tool for tool in required_tools if shutil.which(tool) is None]
     if missing_tools:
         return {
@@ -489,6 +528,11 @@ def _create_vm(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     if seed_error or seed_path is None:
         return "failed", seed_error or "Cloud-init seed error", {}
 
+    network_arg, network_notice = _resolve_network_argument(bridge)
+    if not network_arg:
+        return "failed", network_notice or "Unable to resolve VM network target", {}
+
+    osinfo_value = _resolve_osinfo_value(image)
     virt_cmd = [
         "virt-install",
         "--name",
@@ -503,10 +547,10 @@ def _create_vm(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         "--disk",
         f"path={seed_path},device=cdrom",
         "--network",
-        f"bridge={bridge},model=virtio",
+        network_arg,
         # Newer virt-install builds require explicit OS info to avoid unsafe defaults.
         "--osinfo",
-        "detect=on,require=off",
+        osinfo_value,
         "--graphics",
         "none",
         "--noautoconsole",
@@ -515,7 +559,11 @@ def _create_vm(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     if rc != 0:
         return "failed", f"virt-install failed: {err}", {}
 
-    return "succeeded", "VM created", {
+    result_message = "VM created"
+    if network_notice:
+        result_message = f"{result_message} ({network_notice})"
+
+    return "succeeded", result_message, {
         "vm_id": vm_id,
         "domain_name": domain_name,
         "domain_uuid": _domain_uuid(domain_name),

@@ -305,9 +305,85 @@ export default function NodeVmsPanel({ node, apiBaseUrl, openCreateIntent }: Nod
             <p className="muted">Step {createStep + 1} of 6</p>
             {createStep === 0 ? <input value={createForm.name} placeholder="vm-name" onChange={(e) => updateForm("name", e.target.value)} /> : null}
             {createStep === 1 ? <select className="vm-select" value={createForm.image_id} onChange={(e) => updateForm("image_id", e.target.value)}><option value="">Select image</option>{images.map((image) => <option key={image.id} value={image.id}>{image.name}</option>)}</select> : null}
-            {createStep === 2 ? <div className="vm-form-grid"><input value={createForm.vcpu} onChange={(e) => updateForm("vcpu", e.target.value)} placeholder="vCPU" /><input value={createForm.memory_mb} onChange={(e) => updateForm("memory_mb", e.target.value)} placeholder="Memory MB" /><input value={createForm.disk_gb} onChange={(e) => updateForm("disk_gb", e.target.value)} placeholder="Disk GB" /></div> : null}
-            {createStep === 3 ? <input value={createForm.bridge} onChange={(e) => updateForm("bridge", e.target.value)} placeholder="Bridge (br0)" /> : null}
-            {createStep === 4 ? <div className="vm-form-grid"><input value={createForm.guest_username} onChange={(e) => updateForm("guest_username", e.target.value)} placeholder="Guest username" /><input type="password" value={createForm.guest_password} onChange={(e) => updateForm("guest_password", e.target.value)} placeholder="Guest password" /><input type="password" value={createForm.guest_password_confirm} onChange={(e) => updateForm("guest_password_confirm", e.target.value)} placeholder="Confirm password" /></div> : null}
+            {createStep === 2 ? (
+              <div className="vm-form-grid">
+                <label className="vm-field">
+                  <span className="vm-field-label">vCPU (cores)</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={32}
+                    value={createForm.vcpu}
+                    onChange={(e) => updateForm("vcpu", e.target.value)}
+                    placeholder="2"
+                  />
+                </label>
+                <label className="vm-field">
+                  <span className="vm-field-label">Memory (MB)</span>
+                  <input
+                    type="number"
+                    min={512}
+                    max={262144}
+                    step={256}
+                    value={createForm.memory_mb}
+                    onChange={(e) => updateForm("memory_mb", e.target.value)}
+                    placeholder="2048"
+                  />
+                </label>
+                <label className="vm-field">
+                  <span className="vm-field-label">Disk Size (GB)</span>
+                  <input
+                    type="number"
+                    min={10}
+                    max={4096}
+                    step={1}
+                    value={createForm.disk_gb}
+                    onChange={(e) => updateForm("disk_gb", e.target.value)}
+                    placeholder="20"
+                  />
+                </label>
+              </div>
+            ) : null}
+            {createStep === 3 ? (
+              <label className="vm-field">
+                <span className="vm-field-label">Network Bridge</span>
+                <input
+                  value={createForm.bridge}
+                  onChange={(e) => updateForm("bridge", e.target.value)}
+                  placeholder="br0"
+                />
+              </label>
+            ) : null}
+            {createStep === 4 ? (
+              <div className="vm-form-grid">
+                <label className="vm-field">
+                  <span className="vm-field-label">Guest Username</span>
+                  <input
+                    value={createForm.guest_username}
+                    onChange={(e) => updateForm("guest_username", e.target.value)}
+                    placeholder="ubuntu"
+                  />
+                </label>
+                <label className="vm-field">
+                  <span className="vm-field-label">Guest Password</span>
+                  <input
+                    type="password"
+                    value={createForm.guest_password}
+                    onChange={(e) => updateForm("guest_password", e.target.value)}
+                    placeholder="Enter password"
+                  />
+                </label>
+                <label className="vm-field">
+                  <span className="vm-field-label">Confirm Password</span>
+                  <input
+                    type="password"
+                    value={createForm.guest_password_confirm}
+                    onChange={(e) => updateForm("guest_password_confirm", e.target.value)}
+                    placeholder="Re-enter password"
+                  />
+                </label>
+              </div>
+            ) : null}
             {createStep === 5 ? <pre className="vm-review">{JSON.stringify({ name: createForm.name, image_id: createForm.image_id, vcpu: createForm.vcpu, memory_mb: createForm.memory_mb, disk_gb: createForm.disk_gb, bridge: createForm.bridge, guest_username: createForm.guest_username }, null, 2)}</pre> : null}
             {createError ? <p className="error">{createError}</p> : null}
             <div className="modal-actions">
