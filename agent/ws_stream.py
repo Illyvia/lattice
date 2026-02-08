@@ -7,7 +7,17 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 
-import websocket
+try:
+    import websocket
+except Exception:  # pragma: no cover - runtime environment dependent
+    websocket = None  # type: ignore[assignment]
+
+try:
+    import websockets
+    from websockets.sync.client import connect as websockets_connect
+except Exception:  # pragma: no cover - runtime environment dependent
+    websockets = None  # type: ignore[assignment]
+    websockets_connect = None  # type: ignore[assignment]
 
 
 def build_agent_ws_url(master_url: str) -> str:
@@ -17,6 +27,8 @@ def build_agent_ws_url(master_url: str) -> str:
 
 
 def _safe_module_path(module: Any) -> str:
+    if module is None:
+        return "<not-installed>"
     path = getattr(module, "__file__", None)
     if isinstance(path, str) and path.strip():
         return path
@@ -34,27 +46,137 @@ def _resolve_timeout_exception(timeout_exc: Any) -> tuple[type[BaseException], .
     return tuple(unique)
 
 
-def _resolve_ws_factory() -> tuple[Callable[[str, float], Any] | None, tuple[type[BaseException], ...], str]:
+class _WebSocketConnection:
+    def send(self, payload: str) -> None:
+        raise NotImplementedError
+
+    def recv(self, timeout_seconds: float | None = None) -> str | None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class _WebsocketsSyncConnection(_WebSocketConnection):
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def send(self, payload: str) -> None:
+        self._connection.send(payload)
+
+    def recv(self, timeout_seconds: float | None = None) -> str | None:
+        try:
+            data = self._connection.recv(timeout=timeout_seconds, decode=True)
+        except TimeoutError:
+            return None
+
+        if data is None:
+            return None
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return str(data)
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class _WebsocketClientConnection(_WebSocketConnection):
+    def __init__(self, connection: Any, timeout_exceptions: tuple[type[BaseException], ...]) -> None:
+        self._connection = connection
+        self._timeout_exceptions = timeout_exceptions
+
+    def send(self, payload: str) -> None:
+        self._connection.send(payload)
+
+    def recv(self, timeout_seconds: float | None = None) -> str | None:
+        if timeout_seconds is not None:
+            try:
+                self._connection.settimeout(timeout_seconds)
+            except Exception:
+                pass
+
+        try:
+            data = self._connection.recv()
+        except Exception as exc:
+            if isinstance(exc, self._timeout_exceptions):
+                return None
+            raise
+
+        if data is None:
+            return None
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return str(data)
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def _resolve_websocket_client_factory() -> tuple[Callable[[str, float], _WebSocketConnection] | None, str]:
+    if websocket is None:
+        return None, "<not-installed>"
+
     timeout_exc = getattr(websocket, "WebSocketTimeoutException", None)
+    timeout_exceptions = _resolve_timeout_exception(timeout_exc)
     module_path = _safe_module_path(websocket)
 
     create_connection = getattr(websocket, "create_connection", None)
     if callable(create_connection):
-        def _factory(url: str, timeout_seconds: float) -> Any:
-            return create_connection(url, timeout=timeout_seconds)
 
-        return _factory, _resolve_timeout_exception(timeout_exc), module_path
+        def _factory(url: str, timeout_seconds: float) -> _WebSocketConnection:
+            # Some client stacks incorrectly negotiate permessage-deflate and then fail
+            # to decode compressed frames. Explicitly sending an empty extensions header
+            # keeps the stream uncompressed for compatibility.
+            kwargs: dict[str, Any] = {
+                "timeout": timeout_seconds,
+                "header": ["Sec-WebSocket-Extensions:"],
+            }
+            try:
+                kwargs["enable_multithread"] = True
+                connection = create_connection(url, **kwargs)
+            except TypeError:
+                kwargs.pop("enable_multithread", None)
+                connection = create_connection(url, **kwargs)
+            return _WebsocketClientConnection(connection, timeout_exceptions)
+
+        return _factory, module_path
 
     core = getattr(websocket, "_core", None)
     create_connection_core = getattr(core, "create_connection", None) if core is not None else None
     timeout_exc_core = getattr(core, "WebSocketTimeoutException", timeout_exc) if core is not None else timeout_exc
+    timeout_exceptions_core = _resolve_timeout_exception(timeout_exc_core)
     if callable(create_connection_core):
-        def _factory(url: str, timeout_seconds: float) -> Any:
-            return create_connection_core(url, timeout=timeout_seconds)
 
-        return _factory, _resolve_timeout_exception(timeout_exc_core), module_path
+        def _factory(url: str, timeout_seconds: float) -> _WebSocketConnection:
+            connection = create_connection_core(url, timeout=timeout_seconds)
+            return _WebsocketClientConnection(connection, timeout_exceptions_core)
 
-    return None, _resolve_timeout_exception(timeout_exc), module_path
+        return _factory, module_path
+
+    return None, module_path
+
+
+def _resolve_ws_factory() -> tuple[Callable[[str, float], _WebSocketConnection] | None, str, str]:
+    if callable(websockets_connect):
+
+        def _factory(url: str, timeout_seconds: float) -> _WebSocketConnection:
+            connection = websockets_connect(
+                url,
+                open_timeout=timeout_seconds,
+                ping_interval=None,
+                ping_timeout=None,
+                compression=None,
+                max_size=None,
+            )
+            return _WebsocketsSyncConnection(connection)
+
+        return _factory, "websockets.sync", _safe_module_path(websockets)
+
+    websocket_client_factory, websocket_client_path = _resolve_websocket_client_factory()
+    if websocket_client_factory is not None:
+        return websocket_client_factory, "websocket-client", websocket_client_path
+
+    return None, "none", "<not-installed>"
 
 
 class AgentWebSocketStreamer:
@@ -189,13 +311,14 @@ class AgentWebSocketStreamer:
             return
 
     def _run(self) -> None:
-        ws_factory, timeout_exceptions, ws_module_path = _resolve_ws_factory()
+        ws_factory, ws_backend, ws_module_path = _resolve_ws_factory()
         if ws_factory is None:
             self._log_status(
-                "Agent websocket unavailable: loaded incompatible websocket module at "
-                f"{ws_module_path}. Install websocket-client and remove websocket. "
+                "Agent websocket unavailable: no compatible client backend found. "
+                "Install one of: `websockets` (recommended) or `websocket-client`. "
+                "If `websocket` is installed, remove it first. "
                 "Run: python3 -m pip uninstall -y websocket && "
-                "python3 -m pip install --upgrade websocket-client"
+                "python3 -m pip install --upgrade websockets websocket-client"
             )
             while not self._stop_event.is_set():
                 time.sleep(self.reconnect_seconds)
@@ -204,9 +327,10 @@ class AgentWebSocketStreamer:
         while not self._stop_event.is_set():
             ws = None
             try:
-                self._log_status(f"Agent websocket connecting to {self.ws_url} using {_safe_module_path(websocket)}")
+                self._log_status(
+                    f"Agent websocket connecting to {self.ws_url} using {ws_backend} at {ws_module_path}"
+                )
                 ws = ws_factory(self.ws_url, 10)
-                ws.settimeout(1)
                 ws.send(
                     json.dumps(
                         {
@@ -217,7 +341,9 @@ class AgentWebSocketStreamer:
                     )
                 )
 
-                auth_response_raw = ws.recv()
+                auth_response_raw = ws.recv(timeout_seconds=10)
+                if auth_response_raw is None:
+                    raise RuntimeError("ws auth timed out")
                 auth_response = json.loads(auth_response_raw) if auth_response_raw else {}
                 if not isinstance(auth_response, dict) or auth_response.get("type") != "auth_ok":
                     raise RuntimeError(f"ws auth failed: {auth_response}")
@@ -232,7 +358,7 @@ class AgentWebSocketStreamer:
                         pass
 
                     try:
-                        inbound_raw = ws.recv()
+                        inbound_raw = ws.recv(timeout_seconds=1)
                         if inbound_raw:
                             inbound = json.loads(inbound_raw)
                             if (
@@ -254,11 +380,8 @@ class AgentWebSocketStreamer:
                             ):
                                 # Terminal control/data must preserve strict ordering (open -> input -> resize -> close).
                                 self.terminal_handler(inbound)
-                    except Exception as exc:
-                        if isinstance(exc, timeout_exceptions):
-                            pass
-                        else:
-                            raise
+                    except Exception:
+                        raise
 
                     now = time.monotonic()
                     if now - last_ping_at >= 15:
