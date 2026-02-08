@@ -10,7 +10,7 @@ import {
   faTrashCan
 } from "@fortawesome/free-solid-svg-icons";
 import { faApple, faLinux, faWindows } from "@fortawesome/free-brands-svg-icons";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import NodeVmsPanel from "../components/NodeVmsPanel";
 import NodeTerminalPanel from "../components/NodeTerminalPanel";
 import { NodeLogRecord, NodeRecord, RuntimeMetrics } from "../types";
@@ -186,6 +186,7 @@ export default function NodeDetailPage({
   onUpdateNode
 }: NodeDetailPageProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const { nodeId } = useParams();
   const node = nodes.find((candidate) => candidate.id === nodeId) ?? null;
   const [logs, setLogs] = useState<NodeLogRecord[]>([]);
@@ -229,8 +230,14 @@ export default function NodeDetailPage({
   useEffect(() => {
     setUsePolling(false);
     setStreamConnected(false);
+    const query = new URLSearchParams(location.search);
+    const initialTab = query.get("tab");
+    if (initialTab === "main" || initialTab === "stats" || initialTab === "vms" || initialTab === "terminal") {
+      setActiveTab(initialTab);
+      return;
+    }
     setActiveTab("main");
-  }, [node?.id]);
+  }, [node?.id, location.search]);
 
   useEffect(() => {
     if (logsError) {

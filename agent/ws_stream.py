@@ -372,7 +372,16 @@ class AgentWebSocketStreamer:
                             if (
                                 isinstance(inbound, dict)
                                 and inbound.get("type")
-                                in {"terminal_open", "terminal_input", "terminal_resize", "terminal_close"}
+                                in {
+                                    "terminal_open",
+                                    "terminal_input",
+                                    "terminal_resize",
+                                    "terminal_close",
+                                    "vm_terminal_open",
+                                    "vm_terminal_input",
+                                    "vm_terminal_resize",
+                                    "vm_terminal_close",
+                                }
                                 and self.terminal_handler
                             ):
                                 # Terminal control/data must preserve strict ordering (open -> input -> resize -> close).

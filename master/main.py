@@ -164,12 +164,19 @@ def _clear_agent_ws_messages(node_id: str) -> None:
         AGENT_WS_OUTBOUND_MESSAGES.pop(node_id, None)
 
 
-def _register_terminal_session(node_id: str) -> tuple[str, queue.Queue[dict[str, Any]]]:
+def _register_terminal_session(
+    node_id: str,
+    vm_id: str | None = None,
+    terminal_kind: str = "node_shell",
+) -> tuple[str, queue.Queue[dict[str, Any]]]:
     session_id = str(uuid.uuid4())
     incoming_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
+    normalized_vm_id = vm_id.strip() if isinstance(vm_id, str) and vm_id.strip() else None
     with TERMINAL_SESSIONS_LOCK:
         TERMINAL_SESSIONS[session_id] = {
             "node_id": node_id,
+            "vm_id": normalized_vm_id,
+            "kind": terminal_kind,
             "queue": incoming_queue,
         }
     return session_id, incoming_queue
@@ -1053,6 +1060,176 @@ def ws_node_terminal(ws, node_id: str):
             level="info",
             message="Terminal session closed",
             meta={"session_id": session_id},
+        )
+
+
+@sock.route("/ws/nodes/<node_id>/vms/<vm_id>/terminal")
+def ws_vm_terminal(ws, node_id: str, vm_id: str):
+    clean_node_id = (node_id or "").strip()
+    clean_vm_id = (vm_id or "").strip()
+    if not clean_node_id:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if not clean_vm_id:
+        ws.send(json.dumps({"type": "terminal_error", "error": "vm_not_found"}))
+        return
+
+    node = get_node_by_id(DB_PATH, clean_node_id)
+    if not node:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if node.get("state") != "paired":
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_paired"}))
+        return
+
+    vm_status, vm = get_node_vm(DB_PATH, node_id=clean_node_id, vm_id=clean_vm_id)
+    if vm_status == "not_found":
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if vm_status == "vm_not_found" or not isinstance(vm, dict):
+        ws.send(json.dumps({"type": "terminal_error", "error": "vm_not_found"}))
+        return
+
+    domain_name = str(vm.get("domain_name") or "").strip()
+    if not domain_name:
+        ws.send(json.dumps({"type": "terminal_error", "error": "vm_domain_missing"}))
+        return
+
+    query_string = ""
+    environ = getattr(ws, "environ", None)
+    if isinstance(environ, dict):
+        query_string = str(environ.get("QUERY_STRING", ""))
+    query = parse_qs(query_string)
+
+    cols = _coerce_terminal_size((query.get("cols") or [80])[0], default_value=80, min_value=20, max_value=300)
+    rows = _coerce_terminal_size((query.get("rows") or [24])[0], default_value=24, min_value=5, max_value=120)
+
+    session_id, inbound_queue = _register_terminal_session(
+        clean_node_id,
+        vm_id=clean_vm_id,
+        terminal_kind="vm_console",
+    )
+    _enqueue_agent_ws_message(
+        clean_node_id,
+        {
+            "type": "vm_terminal_open",
+            "session_id": session_id,
+            "vm_id": clean_vm_id,
+            "domain_name": domain_name,
+            "cols": cols,
+            "rows": rows,
+        },
+    )
+    if not _is_agent_connected(clean_node_id):
+        try:
+            inbound_queue.put_nowait(
+                {
+                    "type": "terminal_data",
+                    "session_id": session_id,
+                    "data": "\r\n[waiting for agent websocket connection...]\r\n",
+                }
+            )
+        except queue.Full:
+            pass
+
+    append_node_log(
+        DB_PATH,
+        node_id=clean_node_id,
+        level="info",
+        message="VM terminal session opened",
+        meta={"session_id": session_id, "vm_id": clean_vm_id, "domain_name": domain_name},
+    )
+
+    ws.send(json.dumps({"type": "terminal_ready", "session_id": session_id}))
+
+    try:
+        while True:
+            while True:
+                try:
+                    outbound = inbound_queue.get_nowait()
+                except queue.Empty:
+                    break
+                ws.send(json.dumps(outbound))
+
+            try:
+                raw = ws.receive(timeout=0.2)
+            except TimeoutError:
+                continue
+            if raw is None:
+                # simple-websocket returns None on timeout when no frame is available.
+                # Treat this as idle and keep the session open.
+                continue
+
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_json"}))
+                continue
+
+            if not isinstance(payload, dict):
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_payload"}))
+                continue
+
+            message_type = payload.get("type")
+            if message_type == "input":
+                data = payload.get("data")
+                if not isinstance(data, str):
+                    continue
+                _enqueue_agent_ws_message(
+                    clean_node_id,
+                    {
+                        "type": "vm_terminal_input",
+                        "session_id": session_id,
+                        "vm_id": clean_vm_id,
+                        "data": data,
+                    },
+                )
+                continue
+
+            if message_type == "resize":
+                new_cols = _coerce_terminal_size(payload.get("cols"), default_value=cols, min_value=20, max_value=300)
+                new_rows = _coerce_terminal_size(payload.get("rows"), default_value=rows, min_value=5, max_value=120)
+                cols = new_cols
+                rows = new_rows
+                _enqueue_agent_ws_message(
+                    clean_node_id,
+                    {
+                        "type": "vm_terminal_resize",
+                        "session_id": session_id,
+                        "vm_id": clean_vm_id,
+                        "cols": new_cols,
+                        "rows": new_rows,
+                    },
+                )
+                continue
+
+            if message_type == "ping":
+                ws.send(json.dumps({"type": "pong"}))
+                continue
+
+            if message_type == "close":
+                break
+    except Exception as exc:
+        log.info(
+            f"VM terminal websocket closed node_id={clean_node_id} vm_id={clean_vm_id} "
+            f"session_id={session_id} details={exc}"
+        )
+    finally:
+        _unregister_terminal_session(session_id)
+        _enqueue_agent_ws_message(
+            clean_node_id,
+            {
+                "type": "vm_terminal_close",
+                "session_id": session_id,
+                "vm_id": clean_vm_id,
+            },
+        )
+        append_node_log(
+            DB_PATH,
+            node_id=clean_node_id,
+            level="info",
+            message="VM terminal session closed",
+            meta={"session_id": session_id, "vm_id": clean_vm_id, "domain_name": domain_name},
         )
 
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
   faPlay,
@@ -8,7 +8,8 @@ import {
   faTrashCan
 } from "@fortawesome/free-solid-svg-icons";
 import { toast } from "react-toastify";
-import { NodeRecord, NodeVmRecord, VmImageRecord, VmOperationRecord } from "../types";
+import { useNavigate } from "react-router-dom";
+import { NodeRecord, NodeVmRecord, VmImageRecord } from "../types";
 import { formatTimestamp } from "../utils/health";
 
 type NodeVmsPanelProps = {
@@ -48,16 +49,13 @@ function vmApiUrl(base: string, path: string): string {
 }
 
 export default function NodeVmsPanel({ node, apiBaseUrl, openCreateIntent }: NodeVmsPanelProps) {
+  const navigate = useNavigate();
   const vmCapability = node.capabilities?.vm;
   const vmReady = node.state === "paired" && vmCapability?.ready === true;
   const [images, setImages] = useState<VmImageRecord[]>([]);
   const [vms, setVms] = useState<NodeVmRecord[]>([]);
-  const [selectedVmId, setSelectedVmId] = useState<string | null>(null);
-  const [operations, setOperations] = useState<VmOperationRecord[]>([]);
   const [loading, setLoading] = useState(false);
-  const [opsLoading, setOpsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [opsError, setOpsError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [createStep, setCreateStep] = useState(0);
   const [createForm, setCreateForm] = useState<CreateVmForm>(DEFAULT_FORM);
@@ -65,11 +63,6 @@ export default function NodeVmsPanel({ node, apiBaseUrl, openCreateIntent }: Nod
   const [createError, setCreateError] = useState<string | null>(null);
   const [actionBusyKey, setActionBusyKey] = useState<string | null>(null);
   const [confirmDeleteVm, setConfirmDeleteVm] = useState<NodeVmRecord | null>(null);
-
-  const selectedVm = useMemo(
-    () => vms.find((item) => item.id === selectedVmId) ?? null,
-    [vms, selectedVmId]
-  );
 
   useEffect(() => {
     if (!vmReady || openCreateIntent <= 0) {
@@ -101,7 +94,6 @@ export default function NodeVmsPanel({ node, apiBaseUrl, openCreateIntent }: Nod
         if (cancelled) return;
         setImages(imagesPayload);
         setVms(vmsPayload);
-        setSelectedVmId((current) => current ?? (vmsPayload[0]?.id ?? null));
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -117,54 +109,6 @@ export default function NodeVmsPanel({ node, apiBaseUrl, openCreateIntent }: Nod
       window.clearInterval(timer);
     };
   }, [apiBaseUrl, node.id]);
-
-  useEffect(() => {
-    if (!selectedVmId) {
-      setOperations([]);
-      return;
-    }
-    const vmId = selectedVmId;
-    let cancelled = false;
-    async function loadOps() {
-      setOpsLoading(true);
-      try {
-        const resp = await fetch(
-          vmApiUrl(
-            apiBaseUrl,
-            `/api/nodes/${encodeURIComponent(node.id)}/vms/${encodeURIComponent(vmId)}/operations?limit=50`
-          ),
-          { cache: "no-store" }
-        );
-        if (!resp.ok) {
-          throw new Error(`Failed to load VM operations (${resp.status})`);
-        }
-        const payload = (await resp.json()) as VmOperationRecord[];
-        if (cancelled) return;
-        setOperations(payload);
-        setOpsError(null);
-      } catch (err) {
-        if (cancelled) return;
-        setOpsError(err instanceof Error ? err.message : "Failed to load VM operations");
-      } finally {
-        if (!cancelled) setOpsLoading(false);
-      }
-    }
-    void loadOps();
-    const timer = window.setInterval(loadOps, 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [apiBaseUrl, node.id, selectedVmId]);
-
-  useEffect(() => {
-    if (!selectedVmId && vms.length > 0) {
-      setSelectedVmId(vms[0].id);
-    }
-    if (selectedVmId && !vms.some((vm) => vm.id === selectedVmId)) {
-      setSelectedVmId(vms[0]?.id ?? null);
-    }
-  }, [vms, selectedVmId]);
 
   function updateForm<K extends keyof CreateVmForm>(key: K, value: CreateVmForm[K]) {
     setCreateForm((current) => ({ ...current, [key]: value }));
@@ -283,7 +227,15 @@ export default function NodeVmsPanel({ node, apiBaseUrl, openCreateIntent }: Nod
           <thead><tr><th>Name</th><th>State</th><th>Image</th><th>CPU</th><th>Memory</th><th>Disk</th><th>IP</th><th>Last Op</th><th>Updated</th><th>Actions</th></tr></thead>
           <tbody>
             {vms.map((vm) => (
-              <tr key={vm.id} className="clickable-row" onClick={() => setSelectedVmId(vm.id)}>
+              <tr
+                key={vm.id}
+                className="clickable-row"
+                onClick={() =>
+                  navigate(
+                    `/node/${encodeURIComponent(node.id)}/vm/${encodeURIComponent(vm.id)}`
+                  )
+                }
+              >
                 <td>{vm.name}</td><td><span className={`badge vm-state-${vm.state}`}>{vm.state}</span></td><td>{vm.image_name}</td><td>{vm.vcpu}</td><td>{vm.memory_mb} MB</td><td>{vm.disk_gb} GB</td><td>{vm.ip_address ?? "-"}</td><td>{vm.last_operation ? `${vm.last_operation.operation_type}:${vm.last_operation.status}` : "-"}</td><td>{formatTimestamp(vm.updated_at)}</td>
                 <td className="vm-actions-cell">
                   <button type="button" className="icon-button" disabled={actionBusyKey !== null} onClick={(e) => { e.stopPropagation(); void runVmAction(vm, "start"); }}><FontAwesomeIcon icon={faPlay} /></button>
@@ -297,7 +249,6 @@ export default function NodeVmsPanel({ node, apiBaseUrl, openCreateIntent }: Nod
           </tbody>
         </table>
       </div>
-      {selectedVm ? <section className="vm-ops-panel"><h4>Operation Timeline: {selectedVm.name}</h4>{opsError ? <p className="error">{opsError}</p> : null}<ul className="vm-ops-list">{operations.map((op) => <li key={op.id}><strong>{op.operation_type}</strong> <span className={`badge vm-op-${op.status}`}>{op.status}</span> <span className="muted">{formatTimestamp(op.created_at)}</span>{op.error ? <span className="error"> {op.error}</span> : null}</li>)}</ul>{opsLoading && operations.length === 0 ? <p className="muted">Loading operations...</p> : null}</section> : null}
       {createOpen ? (
         <div className="modal-overlay" onClick={() => !createBusy && setCreateOpen(false)}>
           <div className="modal-card vm-create-modal" onClick={(e) => e.stopPropagation()}>

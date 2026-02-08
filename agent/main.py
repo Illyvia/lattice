@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -512,6 +513,105 @@ class TerminalSessionManager:
         packed = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
 
+    @staticmethod
+    def _is_running_as_root() -> bool:
+        if hasattr(os, "geteuid"):
+            try:
+                return os.geteuid() == 0
+            except Exception:
+                return False
+        return False
+
+    def _virsh_command(self, *args: str) -> list[str]:
+        command = ["virsh", *args]
+        if self._is_running_as_root():
+            return command
+        return ["sudo", "-n", *command]
+
+    def _open_process_session(
+        self,
+        *,
+        session_id: str,
+        cols: Any,
+        rows: Any,
+        command: list[str],
+        cwd: str,
+        env: dict[str, str] | None,
+        session_kind: str,
+        error_prefix: str,
+    ) -> None:
+        clean_session_id = (session_id or "").strip()
+        if not clean_session_id:
+            return
+
+        if os.name == "nt" or not PTY_AVAILABLE:
+            self._send_error(clean_session_id, "Interactive PTY terminal is only available on Unix-like nodes")
+            return
+
+        self.close_session(clean_session_id, send_exit=False)
+
+        terminal_cols = self._clamp(cols, default_value=80, min_value=20, max_value=300)
+        terminal_rows = self._clamp(rows, default_value=24, min_value=5, max_value=120)
+
+        master_fd = -1
+        slave_fd = -1
+        process: subprocess.Popen | None = None
+        try:
+            master_fd, slave_fd = pty.openpty()
+            self._set_terminal_size(master_fd, terminal_cols, terminal_rows)
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            if master_fd >= 0:
+                try:
+                    os.close(master_fd)
+                except Exception:
+                    pass
+            if slave_fd >= 0:
+                try:
+                    os.close(slave_fd)
+                except Exception:
+                    pass
+            self._send_error(clean_session_id, f"{error_prefix}: {exc}")
+            return
+        finally:
+            if slave_fd >= 0:
+                try:
+                    os.close(slave_fd)
+                except Exception:
+                    pass
+
+        if process is None:
+            self._send_error(clean_session_id, error_prefix)
+            return
+
+        stop_event = threading.Event()
+        reader_thread = threading.Thread(
+            target=self._session_reader,
+            args=(clean_session_id,),
+            name=f"terminal-session-{clean_session_id[:8]}",
+            daemon=True,
+        )
+        with self._lock:
+            self._sessions[clean_session_id] = {
+                "master_fd": master_fd,
+                "process": process,
+                "stop_event": stop_event,
+                "thread": reader_thread,
+                "send_exit": True,
+                "kind": session_kind,
+            }
+        reader_thread.start()
+        self._logger.info(f"Opened {session_kind} session session_id={clean_session_id}")
+
     def _session_reader(self, session_id: str) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
@@ -592,75 +692,75 @@ class TerminalSessionManager:
         if not clean_session_id:
             return
 
-        if os.name == "nt" or not PTY_AVAILABLE:
-            self._send_error(clean_session_id, "Interactive PTY terminal is only available on Unix-like nodes")
-            return
-
-        self.close_session(clean_session_id, send_exit=False)
-
-        terminal_cols = self._clamp(cols, default_value=80, min_value=20, max_value=300)
-        terminal_rows = self._clamp(rows, default_value=24, min_value=5, max_value=120)
         shell = os.environ.get("SHELL", "/bin/bash")
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
+        self._open_process_session(
+            session_id=clean_session_id,
+            cols=cols,
+            rows=rows,
+            command=[shell],
+            cwd=str(ROOT_DIR),
+            env=env,
+            session_kind="terminal",
+            error_prefix="Unable to start terminal",
+        )
 
-        master_fd = -1
-        slave_fd = -1
-        process: subprocess.Popen | None = None
+    def open_vm_session(self, session_id: str, domain_name: Any, cols: Any, rows: Any) -> None:
+        clean_session_id = (session_id or "").strip()
+        clean_domain_name = str(domain_name or "").strip()
+        if not clean_session_id:
+            return
+        if not clean_domain_name:
+            self._send_error(clean_session_id, "domain_name is required")
+            return
+
+        if shutil.which("virsh") is None:
+            self._send_error(clean_session_id, "virsh is not installed on this node")
+            return
+        if not self._is_running_as_root() and shutil.which("sudo") is None:
+            self._send_error(clean_session_id, "sudo is required to access libvirt console")
+            return
+
+        state_command = self._virsh_command("domstate", clean_domain_name)
         try:
-            master_fd, slave_fd = pty.openpty()
-            self._set_terminal_size(master_fd, terminal_cols, terminal_rows)
-            process = subprocess.Popen(
-                [shell],
-                cwd=str(ROOT_DIR),
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                env=env,
-                close_fds=True,
-                start_new_session=True,
+            state_result = subprocess.run(
+                state_command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
             )
         except Exception as exc:
-            if master_fd >= 0:
-                try:
-                    os.close(master_fd)
-                except Exception:
-                    pass
-            if slave_fd >= 0:
-                try:
-                    os.close(slave_fd)
-                except Exception:
-                    pass
-            self._send_error(clean_session_id, f"Unable to start terminal: {exc}")
-            return
-        finally:
-            if slave_fd >= 0:
-                try:
-                    os.close(slave_fd)
-                except Exception:
-                    pass
-
-        if process is None:
-            self._send_error(clean_session_id, "Unable to start terminal")
+            self._send_error(clean_session_id, f"Unable to check VM state: {exc}")
             return
 
-        stop_event = threading.Event()
-        reader_thread = threading.Thread(
-            target=self._session_reader,
-            args=(clean_session_id,),
-            name=f"terminal-session-{clean_session_id[:8]}",
-            daemon=True,
+        if state_result.returncode != 0:
+            details = (state_result.stderr or state_result.stdout or "").strip()
+            lower_details = details.lower()
+            if "failed to get domain" in lower_details or "domain not found" in lower_details:
+                self._send_error(clean_session_id, f"VM domain not found: {clean_domain_name}")
+            else:
+                self._send_error(clean_session_id, f"Unable to access VM console: {details or 'unknown error'}")
+            return
+
+        state_text = (state_result.stdout or "").strip().lower()
+        if any(token in state_text for token in ["shut", "off", "crash", "pmsuspended"]):
+            self._send_error(clean_session_id, "VM is not running. Start the VM and reconnect.")
+            return
+
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+        self._open_process_session(
+            session_id=clean_session_id,
+            cols=cols,
+            rows=rows,
+            command=self._virsh_command("console", clean_domain_name),
+            cwd=str(ROOT_DIR),
+            env=env,
+            session_kind="vm_console",
+            error_prefix="Unable to open VM console",
         )
-        with self._lock:
-            self._sessions[clean_session_id] = {
-                "master_fd": master_fd,
-                "process": process,
-                "stop_event": stop_event,
-                "thread": reader_thread,
-                "send_exit": True,
-            }
-        reader_thread.start()
-        self._logger.info(f"Opened terminal session session_id={clean_session_id}")
 
     def write_input(self, session_id: str, data: Any) -> None:
         clean_session_id = (session_id or "").strip()
@@ -944,11 +1044,20 @@ def main() -> None:
             )
             return
 
-        if event_type == "terminal_input":
+        if event_type == "vm_terminal_open":
+            terminal_manager.open_vm_session(
+                session_id=session_id,
+                domain_name=event.get("domain_name"),
+                cols=event.get("cols"),
+                rows=event.get("rows"),
+            )
+            return
+
+        if event_type in {"terminal_input", "vm_terminal_input"}:
             terminal_manager.write_input(session_id=session_id, data=event.get("data"))
             return
 
-        if event_type == "terminal_resize":
+        if event_type in {"terminal_resize", "vm_terminal_resize"}:
             terminal_manager.resize_session(
                 session_id=session_id,
                 cols=event.get("cols"),
@@ -956,7 +1065,7 @@ def main() -> None:
             )
             return
 
-        if event_type == "terminal_close":
+        if event_type in {"terminal_close", "vm_terminal_close"}:
             terminal_manager.close_session(session_id=session_id, send_exit=False)
             return
 
