@@ -171,12 +171,10 @@ def _resolve_ws_factory() -> tuple[Callable[[str, float], _WebSocketConnection] 
             return _WebsocketsSyncConnection(connection)
 
         return _factory, "websockets.sync", _safe_module_path(websockets)
-
-    websocket_client_factory, websocket_client_path = _resolve_websocket_client_factory()
-    if websocket_client_factory is not None:
-        return websocket_client_factory, "websocket-client", websocket_client_path
-
-    return None, "none", "<not-installed>"
+    # The websocket-client fallback is intentionally disabled because some
+    # node environments negotiate/receive RSV-compressed frames and then fail
+    # with "rsv is not implemented, yet", causing reconnect loops.
+    return None, "none", _safe_module_path(websockets)
 
 
 class AgentWebSocketStreamer:
@@ -314,8 +312,7 @@ class AgentWebSocketStreamer:
         ws_factory, ws_backend, ws_module_path = _resolve_ws_factory()
         if ws_factory is None:
             self._log_status(
-                "Agent websocket unavailable: no compatible client backend found. "
-                "Install one of: `websockets` (recommended) or `websocket-client`. "
+                "Agent websocket unavailable: `websockets` is required for stable transport. "
                 "If `websocket` is installed, remove it first. "
                 "Run: python3 -m pip uninstall -y websocket && "
                 "python3 -m pip install --upgrade websockets websocket-client"
