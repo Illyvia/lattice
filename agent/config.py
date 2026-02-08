@@ -5,6 +5,13 @@ from pathlib import Path
 
 
 PAIR_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
+DEFAULT_CONFIG = {
+    "master_url": "http://127.0.0.1:8000",
+    "pair_code": "ABC123",
+    "pair_retry_seconds": 5,
+    "heartbeat_interval_seconds": 10,
+    "heartbeat_timeout_seconds": 5,
+}
 
 
 @dataclass(frozen=True)
@@ -25,7 +32,8 @@ def _require_int(payload: dict, key: str, min_value: int = 1) -> int:
 
 def load_config(path: Path) -> AgentConfig:
     if not path.exists():
-        raise FileNotFoundError(f"Config not found: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     master_url = str(payload.get("master_url", "")).strip().rstrip("/")

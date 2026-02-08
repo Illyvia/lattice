@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 
 agent/state.json
+agent/config.json
 master/master.db
 master/master.db*
 master/master/master.db
