@@ -1,100 +1,245 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
-import { faPaperPlane, faRotateRight, faTerminal } from "@fortawesome/free-solid-svg-icons";
+import { faPlug, faRotateRight, faTerminal } from "@fortawesome/free-solid-svg-icons";
 import { toast } from "react-toastify";
-import { TerminalCommandRecord } from "../types";
-import { formatTimestamp } from "../utils/health";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 
 type NodeTerminalPanelProps = {
   nodeId: string;
   apiBaseUrl: string;
 };
 
-function terminalApiUrl(base: string, path: string): string {
-  return `${base.replace(/\/+$/, "")}${path}`;
+type TerminalWireMessage =
+  | { type: "terminal_ready"; session_id: string }
+  | { type: "terminal_data"; session_id: string; data: string }
+  | { type: "terminal_exit"; session_id: string; exit_code?: number }
+  | { type: "terminal_error"; session_id?: string; error: string }
+  | { type: "pong" };
+
+const DEFAULT_COLS = 110;
+const DEFAULT_ROWS = 28;
+
+function buildTerminalWsUrl(apiBaseUrl: string, nodeId: string, cols: number, rows: number): string {
+  const base = apiBaseUrl.replace(/\/+$/, "");
+  const wsBase = base.replace(/^http/i, (value) => (value.toLowerCase() === "https" ? "wss" : "ws"));
+  const query = `cols=${encodeURIComponent(String(cols))}&rows=${encodeURIComponent(String(rows))}`;
+  return `${wsBase}/ws/nodes/${encodeURIComponent(nodeId)}/terminal?${query}`;
 }
 
-function terminalStatusClass(status: TerminalCommandRecord["status"]): string {
-  if (status === "succeeded") return "terminal-status-succeeded";
-  if (status === "failed") return "terminal-status-failed";
-  if (status === "running") return "terminal-status-running";
-  return "terminal-status-queued";
+function readThemeMode(): "light" | "dark" {
+  const raw = document.documentElement.getAttribute("data-theme");
+  return raw === "dark" ? "dark" : "light";
 }
 
 export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPanelProps) {
-  const [commandText, setCommandText] = useState("");
-  const [items, setItems] = useState<TerminalCommandRecord[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [reconnectKey, setReconnectKey] = useState(0);
 
-  async function loadCommands(withLoading: boolean) {
-    if (withLoading) {
-      setLoading(true);
-    }
-    try {
-      const response = await fetch(
-        terminalApiUrl(apiBaseUrl, `/api/nodes/${encodeURIComponent(nodeId)}/terminal/commands?limit=100`),
-        { cache: "no-store" }
-      );
-      if (!response.ok) {
-        throw new Error(`Failed to load terminal history (${response.status})`);
-      }
-      const payload = (await response.json()) as TerminalCommandRecord[];
-      setItems(Array.isArray(payload) ? payload : []);
-      setError(null);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to load terminal history";
-      setError(message);
-    } finally {
-      if (withLoading) {
-        setLoading(false);
-      }
-    }
-  }
+  const wsUrl = useMemo(
+    () => buildTerminalWsUrl(apiBaseUrl, nodeId, DEFAULT_COLS, DEFAULT_ROWS),
+    [apiBaseUrl, nodeId]
+  );
 
   useEffect(() => {
-    void loadCommands(true);
-    const timer = window.setInterval(() => {
-      void loadCommands(false);
-    }, 2000);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [nodeId, apiBaseUrl]);
-
-  async function runCommand() {
-    const clean = commandText.trim();
-    if (!clean) {
-      toast.error("Enter a command first.");
+    const mount = containerRef.current;
+    if (!mount) {
       return;
     }
 
-    setRunning(true);
-    try {
-      const response = await fetch(
-        terminalApiUrl(apiBaseUrl, `/api/nodes/${encodeURIComponent(nodeId)}/terminal/exec`),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: clean }),
-        }
-      );
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error ?? `Failed to queue command (${response.status})`);
-      }
-      setCommandText("");
-      toast.info("Terminal command queued.");
-      await loadCommands(false);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to queue command";
-      setError(message);
-      toast.error(message);
-    } finally {
-      setRunning(false);
+    const theme = readThemeMode();
+    const terminal = new Terminal({
+      cursorBlink: true,
+      convertEol: false,
+      fontFamily: "JetBrains Mono, Consolas, monospace",
+      fontSize: 13,
+      lineHeight: 1.25,
+      cols: DEFAULT_COLS,
+      rows: DEFAULT_ROWS,
+      theme:
+        theme === "dark"
+          ? {
+              background: "#050507",
+              foreground: "#e8ecf2",
+              cursor: "#e8ecf2",
+              selectionBackground: "#2f3b52",
+            }
+          : {
+              background: "#ffffff",
+              foreground: "#0f172a",
+              cursor: "#0f172a",
+              selectionBackground: "#cbd5e1",
+            },
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(mount);
+    fitAddon.fit();
+    terminal.write("\u001b[1;34mLattice Interactive Terminal\u001b[0m\r\n");
+    terminal.write("Connecting to node shell...\r\n");
+
+    terminalRef.current = terminal;
+    fitAddonRef.current = fitAddon;
+
+    const observer = new MutationObserver(() => {
+      const activeTheme = readThemeMode();
+      terminal.options.theme =
+        activeTheme === "dark"
+          ? {
+              background: "#050507",
+              foreground: "#e8ecf2",
+              cursor: "#e8ecf2",
+              selectionBackground: "#2f3b52",
+            }
+          : {
+              background: "#ffffff",
+              foreground: "#0f172a",
+              cursor: "#0f172a",
+              selectionBackground: "#cbd5e1",
+            };
+    });
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+    return () => {
+      observer.disconnect();
+      socketRef.current?.close();
+      socketRef.current = null;
+      terminalRef.current?.dispose();
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+    };
+  }, [nodeId]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    const fitAddon = fitAddonRef.current;
+    if (!terminal || !fitAddon) {
+      return;
     }
-  }
+
+    let closedByClient = false;
+    setConnecting(true);
+    setConnected(false);
+    setSessionId(null);
+
+    const socket = new WebSocket(wsUrl);
+    socketRef.current = socket;
+
+    const onDataDisposable = terminal.onData((data) => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      socket.send(JSON.stringify({ type: "input", data }));
+    });
+
+    const onResize = () => {
+      if (!terminalRef.current || !fitAddonRef.current) {
+        return;
+      }
+      fitAddonRef.current.fit();
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(
+          JSON.stringify({
+            type: "resize",
+            cols: terminalRef.current.cols,
+            rows: terminalRef.current.rows,
+          })
+        );
+      }
+    };
+    window.addEventListener("resize", onResize);
+
+    socket.onopen = () => {
+      setConnecting(false);
+      setConnected(true);
+      onResize();
+      terminal.writeln("");
+      terminal.writeln("\u001b[32mConnected.\u001b[0m");
+    };
+
+    socket.onmessage = (event) => {
+      const terminalInstance = terminalRef.current;
+      if (!terminalInstance) {
+        return;
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      if (!payload || typeof payload !== "object") {
+        return;
+      }
+      const message = payload as TerminalWireMessage;
+      if (message.type === "terminal_ready") {
+        setSessionId(message.session_id);
+        return;
+      }
+      if (message.type === "terminal_data") {
+        if (typeof message.data === "string") {
+          terminalInstance.write(message.data);
+        }
+        return;
+      }
+      if (message.type === "terminal_exit") {
+        const code = typeof message.exit_code === "number" ? message.exit_code : 0;
+        terminalInstance.writeln(`\r\n\u001b[33m[process exited: ${code}]\u001b[0m`);
+        return;
+      }
+      if (message.type === "terminal_error") {
+        const detail = message.error || "terminal error";
+        terminalInstance.writeln(`\r\n\u001b[31m[terminal error] ${detail}\u001b[0m`);
+        toast.error(`Terminal error: ${detail}`);
+      }
+    };
+
+    socket.onerror = () => {
+      const terminalInstance = terminalRef.current;
+      if (terminalInstance) {
+        terminalInstance.writeln("\r\n\u001b[31m[connection error]\u001b[0m");
+      }
+    };
+
+    socket.onclose = () => {
+      setConnecting(false);
+      setConnected(false);
+      setSessionId(null);
+      const terminalInstance = terminalRef.current;
+      if (terminalInstance) {
+        terminalInstance.writeln("");
+        terminalInstance.writeln(
+          closedByClient
+            ? "\u001b[90m[terminal disconnected]\u001b[0m"
+            : "\u001b[31m[terminal connection closed]\u001b[0m"
+        );
+      }
+    };
+
+    return () => {
+      onDataDisposable.dispose();
+      window.removeEventListener("resize", onResize);
+      closedByClient = true;
+      try {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "close" }));
+        }
+      } catch {
+        // Best effort close message.
+      }
+      socket.close();
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
+    };
+  }, [wsUrl, reconnectKey]);
 
   return (
     <section className="terminal-card">
@@ -102,67 +247,26 @@ export default function NodeTerminalPanel({ nodeId, apiBaseUrl }: NodeTerminalPa
         <h3>
           <FontAwesomeIcon icon={faTerminal} /> Terminal
         </h3>
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() => void loadCommands(true)}
-          disabled={loading}
-        >
-          <FontAwesomeIcon icon={faRotateRight} />
-          <span>Refresh</span>
-        </button>
+        <div className="terminal-controls">
+          <span className={`terminal-connection ${connected ? "terminal-connection-on" : "terminal-connection-off"}`}>
+            <FontAwesomeIcon icon={faPlug} />
+            {connected ? "connected" : connecting ? "connecting" : "disconnected"}
+          </span>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => setReconnectKey((value) => value + 1)}
+            disabled={connecting}
+          >
+            <FontAwesomeIcon icon={faRotateRight} />
+            <span>Reconnect</span>
+          </button>
+        </div>
       </div>
-
-      <p className="muted">Runs shell commands on this node through the agent command queue.</p>
-
-      <div className="terminal-runner">
-        <input
-          value={commandText}
-          onChange={(event) => setCommandText(event.target.value)}
-          placeholder="Type command, e.g. uname -a"
-          disabled={running}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void runCommand();
-            }
-          }}
-        />
-        <button type="button" onClick={() => void runCommand()} disabled={running}>
-          <FontAwesomeIcon icon={faPaperPlane} />
-          <span>{running ? "Queueing..." : "Run"}</span>
-        </button>
-      </div>
-
-      {error ? <p className="error">{error}</p> : null}
-
-      <div className="terminal-history">
-        {loading && items.length === 0 ? <p className="muted">Loading terminal history...</p> : null}
-        {!loading && items.length === 0 ? <p className="muted">No terminal commands yet.</p> : null}
-        {items.map((item) => (
-          <article key={item.id} className="terminal-entry">
-            <div className="terminal-entry-header">
-              <code className="terminal-command-text">{item.command_text}</code>
-              <span className={`terminal-status ${terminalStatusClass(item.status)}`}>{item.status}</span>
-            </div>
-            <div className="terminal-entry-meta">
-              <span>{formatTimestamp(item.created_at)}</span>
-              <span>exit: {item.exit_code ?? "-"}</span>
-            </div>
-            {item.stdout_text ? (
-              <pre className="terminal-output">
-                <code>{item.stdout_text}</code>
-              </pre>
-            ) : null}
-            {item.stderr_text ? (
-              <pre className="terminal-output terminal-output-error">
-                <code>{item.stderr_text}</code>
-              </pre>
-            ) : null}
-            {item.error ? <p className="error">{item.error}</p> : null}
-          </article>
-        ))}
-      </div>
+      <p className="muted">
+        Interactive PTY session on this node {sessionId ? `(session ${sessionId.slice(0, 8)})` : ""}.
+      </p>
+      <div ref={containerRef} className="terminal-emulator" />
     </section>
   );
 }

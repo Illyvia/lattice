@@ -8,9 +8,20 @@ import subprocess
 import sys
 import threading
 import time
+import selectors
+import struct
 from typing import Any, Callable
 from urllib import error, request
 from urllib.parse import quote
+
+try:
+    import fcntl
+    import pty
+    import termios
+
+    PTY_AVAILABLE = True
+except Exception:
+    PTY_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 AGENT_DIR = Path(__file__).resolve().parent
@@ -455,6 +466,260 @@ class CommandPoller:
             self._stop_event.wait(self.poll_interval_seconds)
 
 
+class TerminalSessionManager:
+    def __init__(
+        self,
+        streamer_provider: Callable[[], AgentWebSocketStreamer | None],
+        logger: logging.Logger,
+    ) -> None:
+        self._streamer_provider = streamer_provider
+        self._logger = logger
+        self._lock = threading.Lock()
+        self._sessions: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _clamp(value: Any, default_value: int, min_value: int, max_value: int) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = default_value
+        return max(min_value, min(max_value, number))
+
+    def _streamer(self) -> AgentWebSocketStreamer | None:
+        try:
+            return self._streamer_provider()
+        except Exception:
+            return None
+
+    def _send_data(self, session_id: str, data: str) -> None:
+        streamer = self._streamer()
+        if streamer:
+            streamer.send_terminal_data(session_id, data)
+
+    def _send_exit(self, session_id: str, exit_code: int | None) -> None:
+        streamer = self._streamer()
+        if streamer:
+            streamer.send_terminal_exit(session_id, exit_code)
+
+    def _send_error(self, session_id: str, error_message: str) -> None:
+        streamer = self._streamer()
+        if streamer:
+            streamer.send_terminal_error(session_id, error_message)
+
+    def _set_terminal_size(self, fd: int, cols: int, rows: int) -> None:
+        if not PTY_AVAILABLE:
+            return
+        packed = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
+
+    def _session_reader(self, session_id: str) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+        if not session:
+            return
+
+        process: subprocess.Popen = session["process"]
+        master_fd: int = int(session["master_fd"])
+        stop_event: threading.Event = session["stop_event"]
+        send_exit = True
+        exit_code: int | None = None
+        selector = selectors.DefaultSelector()
+
+        try:
+            os.set_blocking(master_fd, False)
+            selector.register(master_fd, selectors.EVENT_READ)
+            while not stop_event.is_set():
+                events = selector.select(timeout=0.2)
+                if not events:
+                    if process.poll() is not None:
+                        break
+                    continue
+
+                for _key, _mask in events:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        chunk = b""
+
+                    if not chunk:
+                        break
+                    self._send_data(session_id, chunk.decode("utf-8", errors="replace"))
+
+                if process.poll() is not None:
+                    break
+
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+            exit_code = process.poll()
+        except Exception as exc:
+            self._send_error(session_id, f"Terminal stream error: {exc}")
+        finally:
+            try:
+                selector.close()
+            except Exception:
+                pass
+
+            with self._lock:
+                latest = self._sessions.pop(session_id, None)
+            if latest:
+                send_exit = bool(latest.get("send_exit", True))
+
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+
+            if send_exit:
+                self._send_exit(session_id, exit_code)
+
+    def open_session(self, session_id: str, cols: Any, rows: Any) -> None:
+        clean_session_id = (session_id or "").strip()
+        if not clean_session_id:
+            return
+
+        if os.name == "nt" or not PTY_AVAILABLE:
+            self._send_error(clean_session_id, "Interactive PTY terminal is only available on Unix-like nodes")
+            return
+
+        self.close_session(clean_session_id, send_exit=False)
+
+        terminal_cols = self._clamp(cols, default_value=80, min_value=20, max_value=300)
+        terminal_rows = self._clamp(rows, default_value=24, min_value=5, max_value=120)
+        shell = os.environ.get("SHELL", "/bin/bash")
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+
+        master_fd = -1
+        slave_fd = -1
+        process: subprocess.Popen | None = None
+        try:
+            master_fd, slave_fd = pty.openpty()
+            self._set_terminal_size(master_fd, terminal_cols, terminal_rows)
+            process = subprocess.Popen(
+                [shell],
+                cwd=str(ROOT_DIR),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            if master_fd >= 0:
+                try:
+                    os.close(master_fd)
+                except Exception:
+                    pass
+            if slave_fd >= 0:
+                try:
+                    os.close(slave_fd)
+                except Exception:
+                    pass
+            self._send_error(clean_session_id, f"Unable to start terminal: {exc}")
+            return
+        finally:
+            if slave_fd >= 0:
+                try:
+                    os.close(slave_fd)
+                except Exception:
+                    pass
+
+        if process is None:
+            self._send_error(clean_session_id, "Unable to start terminal")
+            return
+
+        stop_event = threading.Event()
+        reader_thread = threading.Thread(
+            target=self._session_reader,
+            args=(clean_session_id,),
+            name=f"terminal-session-{clean_session_id[:8]}",
+            daemon=True,
+        )
+        with self._lock:
+            self._sessions[clean_session_id] = {
+                "master_fd": master_fd,
+                "process": process,
+                "stop_event": stop_event,
+                "thread": reader_thread,
+                "send_exit": True,
+            }
+        reader_thread.start()
+        self._logger.info(f"Opened terminal session session_id={clean_session_id}")
+
+    def write_input(self, session_id: str, data: Any) -> None:
+        clean_session_id = (session_id or "").strip()
+        if not clean_session_id:
+            return
+        if not isinstance(data, str) or data == "":
+            return
+        with self._lock:
+            session = self._sessions.get(clean_session_id)
+        if not session:
+            self._send_error(clean_session_id, "terminal session not found")
+            return
+        master_fd = int(session["master_fd"])
+        try:
+            os.write(master_fd, data.encode("utf-8", errors="ignore"))
+        except Exception as exc:
+            self._send_error(clean_session_id, f"terminal input failed: {exc}")
+
+    def resize_session(self, session_id: str, cols: Any, rows: Any) -> None:
+        clean_session_id = (session_id or "").strip()
+        if not clean_session_id:
+            return
+        with self._lock:
+            session = self._sessions.get(clean_session_id)
+        if not session:
+            return
+        master_fd = int(session["master_fd"])
+        terminal_cols = self._clamp(cols, default_value=80, min_value=20, max_value=300)
+        terminal_rows = self._clamp(rows, default_value=24, min_value=5, max_value=120)
+        try:
+            self._set_terminal_size(master_fd, terminal_cols, terminal_rows)
+        except Exception:
+            pass
+
+    def close_session(self, session_id: str, send_exit: bool = True) -> None:
+        clean_session_id = (session_id or "").strip()
+        if not clean_session_id:
+            return
+        with self._lock:
+            session = self._sessions.get(clean_session_id)
+            if not session:
+                return
+            session["send_exit"] = bool(send_exit)
+            stop_event: threading.Event = session["stop_event"]
+            process: subprocess.Popen = session["process"]
+        stop_event.set()
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            pass
+
+    def close_all(self, send_exit: bool = False) -> None:
+        with self._lock:
+            session_ids = list(self._sessions.keys())
+        for session_id in session_ids:
+            self.close_session(session_id, send_exit=send_exit)
+
+
 def main() -> None:
     log.rawlog("""                                                                                                                              
                                         @@*                 %@@      @@-                                                      
@@ -522,6 +787,7 @@ def main() -> None:
     ws_streamer: AgentWebSocketStreamer | None = None
     ws_log_handler: WebSocketLogHandler | None = None
     command_poller: CommandPoller | None = None
+    terminal_manager = TerminalSessionManager(lambda: ws_streamer, log)
     update_in_progress = threading.Event()
     vm_command_in_progress = threading.Event()
     terminal_command_in_progress = threading.Event()
@@ -662,12 +928,45 @@ def main() -> None:
 
         execute_command(command, ws_result_sender)
 
+    def handle_terminal_event(event: dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        session_id = event.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            return
+
+        if event_type == "terminal_open":
+            terminal_manager.open_session(
+                session_id=session_id,
+                cols=event.get("cols"),
+                rows=event.get("rows"),
+            )
+            return
+
+        if event_type == "terminal_input":
+            terminal_manager.write_input(session_id=session_id, data=event.get("data"))
+            return
+
+        if event_type == "terminal_resize":
+            terminal_manager.resize_session(
+                session_id=session_id,
+                cols=event.get("cols"),
+                rows=event.get("rows"),
+            )
+            return
+
+        if event_type == "terminal_close":
+            terminal_manager.close_session(session_id=session_id, send_exit=False)
+            return
+
     def start_ws_streamer(current_state: dict[str, str]) -> None:
         nonlocal ws_streamer, ws_log_handler
         if ws_log_handler:
             log.removeHandler(ws_log_handler)
             ws_log_handler = None
         if ws_streamer:
+            terminal_manager.close_all(send_exit=False)
             ws_streamer.stop()
             ws_streamer = None
 
@@ -676,6 +975,7 @@ def main() -> None:
             node_id=current_state["node_id"],
             pair_token=current_state["pair_token"],
             command_handler=handle_ws_command,
+            terminal_handler=handle_terminal_event,
         )
         ws_streamer.start()
         ws_log_handler = WebSocketLogHandler(ws_streamer)
@@ -728,6 +1028,7 @@ def main() -> None:
                 if command_poller:
                     command_poller.stop()
                     command_poller = None
+                terminal_manager.close_all(send_exit=False)
                 clear_state(STATE_PATH)
                 log.info("Cleared local state; retrying pair flow")
                 state = pair_until_success(config)
@@ -748,6 +1049,7 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Agent shutdown requested")
     finally:
+        terminal_manager.close_all(send_exit=False)
         if ws_log_handler:
             log.removeHandler(ws_log_handler)
             ws_log_handler = None

@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import os
+import queue
 import socket
 import sys
 import threading
@@ -85,6 +86,9 @@ sock = Sock(app)
 AGENT_COMMANDS_LOCK = threading.Lock()
 PENDING_AGENT_COMMANDS: dict[str, list[dict[str, Any]]] = {}
 ACTIVE_AGENT_CONNECTIONS: dict[str, str] = {}
+AGENT_WS_OUTBOUND_MESSAGES: dict[str, list[dict[str, Any]]] = {}
+TERMINAL_SESSIONS_LOCK = threading.Lock()
+TERMINAL_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 def _utc_now() -> str:
@@ -132,6 +136,85 @@ def _deactivate_agent_connection(node_id: str, connection_id: str) -> bool:
 def _is_agent_connected(node_id: str) -> bool:
     with AGENT_COMMANDS_LOCK:
         return node_id in ACTIVE_AGENT_CONNECTIONS
+
+
+def _enqueue_agent_ws_message(node_id: str, payload: dict[str, Any]) -> None:
+    with AGENT_COMMANDS_LOCK:
+        messages = AGENT_WS_OUTBOUND_MESSAGES.setdefault(node_id, [])
+        messages.append(payload)
+        if len(messages) > 2000:
+            del messages[:-1000]
+
+
+def _drain_agent_ws_messages(node_id: str, max_items: int = 100) -> list[dict[str, Any]]:
+    with AGENT_COMMANDS_LOCK:
+        messages = AGENT_WS_OUTBOUND_MESSAGES.get(node_id)
+        if not messages:
+            return []
+        take = max(1, min(max_items, len(messages)))
+        chunk = messages[:take]
+        del messages[:take]
+        if not messages:
+            AGENT_WS_OUTBOUND_MESSAGES.pop(node_id, None)
+        return chunk
+
+
+def _clear_agent_ws_messages(node_id: str) -> None:
+    with AGENT_COMMANDS_LOCK:
+        AGENT_WS_OUTBOUND_MESSAGES.pop(node_id, None)
+
+
+def _register_terminal_session(node_id: str) -> tuple[str, queue.Queue[dict[str, Any]]]:
+    session_id = str(uuid.uuid4())
+    incoming_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
+    with TERMINAL_SESSIONS_LOCK:
+        TERMINAL_SESSIONS[session_id] = {
+            "node_id": node_id,
+            "queue": incoming_queue,
+        }
+    return session_id, incoming_queue
+
+
+def _unregister_terminal_session(session_id: str) -> None:
+    with TERMINAL_SESSIONS_LOCK:
+        TERMINAL_SESSIONS.pop(session_id, None)
+
+
+def _enqueue_terminal_session_event(session_id: str, payload: dict[str, Any]) -> bool:
+    with TERMINAL_SESSIONS_LOCK:
+        session = TERMINAL_SESSIONS.get(session_id)
+    if not session:
+        return False
+    incoming_queue = session.get("queue")
+    if not isinstance(incoming_queue, queue.Queue):
+        return False
+    try:
+        incoming_queue.put_nowait(payload)
+        return True
+    except queue.Full:
+        try:
+            _ = incoming_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            incoming_queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            return False
+
+
+def _close_terminal_sessions_for_node(node_id: str, reason: str) -> None:
+    with TERMINAL_SESSIONS_LOCK:
+        session_ids = [session_id for session_id, data in TERMINAL_SESSIONS.items() if data.get("node_id") == node_id]
+    for session_id in session_ids:
+        _enqueue_terminal_session_event(
+            session_id,
+            {
+                "type": "terminal_error",
+                "session_id": session_id,
+                "error": reason,
+            },
+        )
 
 
 def _apply_cors_headers(response):
@@ -824,6 +907,145 @@ def ws_node_logs_compat(ws, node_id: str):
     _stream_node_logs_ws(ws, node_id=node_id, limit=limit)
 
 
+def _coerce_terminal_size(value: Any, default_value: int, min_value: int, max_value: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default_value
+    return max(min_value, min(max_value, number))
+
+
+@sock.route("/ws/nodes/<node_id>/terminal")
+def ws_node_terminal(ws, node_id: str):
+    clean_node_id = (node_id or "").strip()
+    if not clean_node_id:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+
+    node = get_node_by_id(DB_PATH, clean_node_id)
+    if not node:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if node.get("state") != "paired":
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_paired"}))
+        return
+    if not _is_agent_connected(clean_node_id):
+        ws.send(json.dumps({"type": "terminal_error", "error": "agent_not_connected"}))
+        return
+
+    query_string = ""
+    environ = getattr(ws, "environ", None)
+    if isinstance(environ, dict):
+        query_string = str(environ.get("QUERY_STRING", ""))
+    query = parse_qs(query_string)
+
+    cols = _coerce_terminal_size((query.get("cols") or [80])[0], default_value=80, min_value=20, max_value=300)
+    rows = _coerce_terminal_size((query.get("rows") or [24])[0], default_value=24, min_value=5, max_value=120)
+
+    session_id, inbound_queue = _register_terminal_session(clean_node_id)
+    _enqueue_agent_ws_message(
+        clean_node_id,
+        {
+            "type": "terminal_open",
+            "session_id": session_id,
+            "cols": cols,
+            "rows": rows,
+        },
+    )
+
+    append_node_log(
+        DB_PATH,
+        node_id=clean_node_id,
+        level="info",
+        message="Terminal session opened",
+        meta={"session_id": session_id},
+    )
+
+    ws.send(json.dumps({"type": "terminal_ready", "session_id": session_id}))
+
+    try:
+        while True:
+            while True:
+                try:
+                    outbound = inbound_queue.get_nowait()
+                except queue.Empty:
+                    break
+                ws.send(json.dumps(outbound))
+
+            try:
+                raw = ws.receive(timeout=0.2)
+            except TimeoutError:
+                continue
+            if raw is None:
+                break
+
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_json"}))
+                continue
+
+            if not isinstance(payload, dict):
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_payload"}))
+                continue
+
+            message_type = payload.get("type")
+            if message_type == "input":
+                data = payload.get("data")
+                if not isinstance(data, str):
+                    continue
+                _enqueue_agent_ws_message(
+                    clean_node_id,
+                    {
+                        "type": "terminal_input",
+                        "session_id": session_id,
+                        "data": data,
+                    },
+                )
+                continue
+
+            if message_type == "resize":
+                new_cols = _coerce_terminal_size(payload.get("cols"), default_value=cols, min_value=20, max_value=300)
+                new_rows = _coerce_terminal_size(payload.get("rows"), default_value=rows, min_value=5, max_value=120)
+                cols = new_cols
+                rows = new_rows
+                _enqueue_agent_ws_message(
+                    clean_node_id,
+                    {
+                        "type": "terminal_resize",
+                        "session_id": session_id,
+                        "cols": new_cols,
+                        "rows": new_rows,
+                    },
+                )
+                continue
+
+            if message_type == "ping":
+                ws.send(json.dumps({"type": "pong"}))
+                continue
+
+            if message_type == "close":
+                break
+    except Exception as exc:
+        log.info(f"Terminal websocket closed node_id={clean_node_id} session_id={session_id} details={exc}")
+    finally:
+        _unregister_terminal_session(session_id)
+        _enqueue_agent_ws_message(
+            clean_node_id,
+            {
+                "type": "terminal_close",
+                "session_id": session_id,
+            },
+        )
+        append_node_log(
+            DB_PATH,
+            node_id=clean_node_id,
+            level="info",
+            message="Terminal session closed",
+            meta={"session_id": session_id},
+        )
+
+
 @sock.route("/ws/agent")
 def ws_agent(ws):
     node_id: str | None = None
@@ -839,8 +1061,12 @@ def ws_agent(ws):
             if authenticated and node_id and not _is_current_agent_connection(node_id, connection_id):
                 send_message({"type": "error", "error": "superseded_connection"})
                 break
+            if authenticated and node_id:
+                outbound_messages = _drain_agent_ws_messages(node_id, max_items=200)
+                for outbound in outbound_messages:
+                    send_message(outbound)
             try:
-                raw = ws.receive(timeout=1)
+                raw = ws.receive(timeout=0.1)
             except TimeoutError:
                 continue
             if raw is None:
@@ -971,6 +1197,16 @@ def ws_agent(ws):
                     send_message({"type": "error", "error": "operation_not_found"})
                 continue
 
+            if message_type in {"terminal_data", "terminal_exit", "terminal_error"}:
+                session_id = payload.get("session_id")
+                if not isinstance(session_id, str) or not session_id.strip():
+                    send_message({"type": "error", "error": "session_id is required"})
+                    continue
+                ok = _enqueue_terminal_session_event(session_id.strip(), payload)
+                if not ok:
+                    send_message({"type": "error", "error": "terminal_session_not_found"})
+                continue
+
             if message_type == "ping":
                 send_message({"type": "pong"})
                 continue
@@ -982,6 +1218,8 @@ def ws_agent(ws):
         if authenticated and node_id:
             was_active = _deactivate_agent_connection(node_id, connection_id)
             if was_active:
+                _clear_agent_ws_messages(node_id)
+                _close_terminal_sessions_for_node(node_id, "Agent websocket disconnected")
                 append_node_log(
                     DB_PATH,
                     node_id=node_id,

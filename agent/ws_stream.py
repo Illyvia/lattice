@@ -22,6 +22,7 @@ class AgentWebSocketStreamer:
         node_id: str,
         pair_token: str,
         command_handler: Callable[[dict], None] | None = None,
+        terminal_handler: Callable[[dict], None] | None = None,
         reconnect_seconds: int = 3,
         queue_size: int = 1000,
     ) -> None:
@@ -29,6 +30,7 @@ class AgentWebSocketStreamer:
         self.node_id = node_id
         self.pair_token = pair_token
         self.command_handler = command_handler
+        self.terminal_handler = terminal_handler
         self.reconnect_seconds = max(1, reconnect_seconds)
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=max(10, queue_size))
         self._stop_event = threading.Event()
@@ -95,6 +97,32 @@ class AgentWebSocketStreamer:
             event["vm_id"] = vm_id.strip()
         self._enqueue(event)
 
+    def send_terminal_data(self, session_id: str, data: str) -> None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return
+        if not isinstance(data, str) or data == "":
+            return
+        self._enqueue({"type": "terminal_data", "session_id": session_id.strip(), "data": data})
+
+    def send_terminal_exit(self, session_id: str, exit_code: int | None = None) -> None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return
+        payload: dict[str, object] = {"type": "terminal_exit", "session_id": session_id.strip()}
+        if isinstance(exit_code, int):
+            payload["exit_code"] = exit_code
+        self._enqueue(payload)
+
+    def send_terminal_error(self, session_id: str, error_message: str) -> None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return
+        self._enqueue(
+            {
+                "type": "terminal_error",
+                "session_id": session_id.strip(),
+                "error": str(error_message or "terminal error"),
+            }
+        )
+
     def _enqueue(self, event: dict) -> None:
         try:
             self._queue.put_nowait(event)
@@ -150,6 +178,18 @@ class AgentWebSocketStreamer:
                                     target=self.command_handler,
                                     args=(inbound,),
                                     name="agent-command-handler",
+                                    daemon=True,
+                                ).start()
+                            if (
+                                isinstance(inbound, dict)
+                                and inbound.get("type")
+                                in {"terminal_open", "terminal_input", "terminal_resize", "terminal_close"}
+                                and self.terminal_handler
+                            ):
+                                threading.Thread(
+                                    target=self.terminal_handler,
+                                    args=(inbound,),
+                                    name="agent-terminal-handler",
                                     daemon=True,
                                 ).start()
                     except websocket.WebSocketTimeoutException:
