@@ -154,6 +154,8 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
     let closedByClient = false;
     let isDisposed = false;
     let sawAgentNotConnected = false;
+    let didOpen = false;
+    let sentInitialCarriageReturn = false;
     setConnecting(true);
     setConnected(false);
     setSessionId(null);
@@ -192,6 +194,7 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
     window.addEventListener("resize", onResize);
 
     socket.onopen = () => {
+      didOpen = true;
       setConnecting(false);
       setConnected(true);
       reconnectAttemptsRef.current = 0;
@@ -217,6 +220,11 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       const message = payload as TerminalWireMessage;
       if (message.type === "terminal_ready") {
         setSessionId(message.session_id);
+        if (!sentInitialCarriageReturn && socket.readyState === WebSocket.OPEN) {
+          sentInitialCarriageReturn = true;
+          // Many VM serial consoles need an initial Enter to reveal the login prompt.
+          socket.send(JSON.stringify({ type: "input", data: "\r" }));
+        }
         return;
       }
       if (message.type === "terminal_data") {
@@ -247,7 +255,7 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
 
     socket.onerror = () => {
       const terminalInstance = terminalRef.current;
-      if (terminalInstance && !sawAgentNotConnected) {
+      if (terminalInstance && !sawAgentNotConnected && !closedByClient) {
         terminalInstance.writeln("\r\n\u001b[31m[connection error]\u001b[0m");
       }
     };
@@ -284,12 +292,14 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
       setSessionId(null);
       const terminalInstance = terminalRef.current;
       if (terminalInstance) {
-        terminalInstance.writeln("");
-        terminalInstance.writeln(
-          closedByClient
-            ? "\u001b[90m[terminal disconnected]\u001b[0m"
-            : "\u001b[31m[terminal connection closed]\u001b[0m"
-        );
+        if (!closedByClient || didOpen) {
+          terminalInstance.writeln("");
+          terminalInstance.writeln(
+            closedByClient
+              ? "\u001b[90m[terminal disconnected]\u001b[0m"
+              : "\u001b[31m[terminal connection closed]\u001b[0m"
+          );
+        }
       }
       scheduleReconnect();
     };
@@ -347,4 +357,3 @@ export default function VmTerminalPanel({ nodeId, vmId, vmName, apiBaseUrl }: Vm
     </section>
   );
 }
-

@@ -496,6 +496,9 @@ def _create_cloud_init_seed(vm_dir: Path, domain_name: str, username: str, passw
         "ssh_pwauth: true\n"
         "chpasswd:\n"
         "  expire: false\n"
+        # Ensure a serial login prompt is available for virsh console access.
+        "runcmd:\n"
+        "  - [ sh, -c, \"systemctl enable --now serial-getty@ttyS0.service || true\" ]\n"
     )
     meta_data = f"instance-id: {domain_name}\nlocal-hostname: {domain_name}\n"
     user_data_path.write_text(user_data, encoding="utf-8")
@@ -568,6 +571,10 @@ def _create_vm(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         f"path={seed_path},device=cdrom",
         "--network",
         network_arg,
+        "--serial",
+        "pty",
+        "--console",
+        "pty,target.type=serial",
         # Newer virt-install builds require explicit OS info to avoid unsafe defaults.
         "--osinfo",
         osinfo_value,
