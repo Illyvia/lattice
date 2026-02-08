@@ -201,15 +201,20 @@ def execute_agent_update(force: bool = False, branch: str | None = None) -> tupl
     if rc != 0:
         return "failed", "Unable to check working tree state", {"stderr": err}
     if dirty_status.strip() and not force:
-        changed_lines = [line.strip() for line in dirty_status.splitlines() if line.strip()]
+        ignored_local_paths = {"agent/config.json", "agent\\config.json"}
+        changed_lines = [line.rstrip() for line in dirty_status.splitlines() if line.strip()]
         changed_files: list[str] = []
         for line in changed_lines:
             # Porcelain format is "XY <path>".
-            changed_files.append(line[3:] if len(line) > 3 else line)
+            path = line[3:] if len(line) > 3 else line.lstrip()
+            normalized = path.replace("\\", "/")
+            if normalized in ignored_local_paths:
+                continue
+            changed_files.append(path)
         return (
-            "failed",
-            "Working tree has local changes; commit, stash, or discard changes before update",
-            {"changed_files": changed_files[:25]},
+            ("failed", "Working tree has local changes; commit, stash, or discard changes before update", {"changed_files": changed_files[:25]})
+            if changed_files
+            else ("up_to_date", "Only local config changes detected; update can continue", {"changed_files": []})
         )
 
     fetch_args = ["git", "fetch", "--all", "--prune"]
