@@ -286,6 +286,35 @@ def execute_agent_update(force: bool = False, branch: str | None = None) -> tupl
     }
 
 
+def execute_terminal_shell(command_text: str) -> tuple[str, str, dict[str, Any]]:
+    clean_command = (command_text or "").strip()
+    if not clean_command:
+        return "failed", "command is required", {}
+
+    try:
+        completed = subprocess.run(
+            clean_command,
+            cwd=str(ROOT_DIR),
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return "failed", "Command timed out", {"timeout_seconds": 120, "stdout": exc.stdout or "", "stderr": exc.stderr or ""}
+    except Exception as exc:
+        return "failed", f"Failed to execute command: {exc}", {}
+
+    stdout_text = (completed.stdout or "")[:20000]
+    stderr_text = (completed.stderr or "")[:20000]
+    exit_code = int(completed.returncode)
+    details = {"stdout": stdout_text, "stderr": stderr_text, "exit_code": exit_code}
+    if exit_code == 0:
+        return "succeeded", "Command completed", details
+    return "failed", f"Command exited with code {exit_code}", details
+
+
 def _build_agent_command_url(master_url: str, node_id: str, suffix: str) -> str:
     return f"{master_url.rstrip('/')}/api/nodes/{quote(node_id)}/commands/{suffix}"
 
@@ -495,6 +524,7 @@ def main() -> None:
     command_poller: CommandPoller | None = None
     update_in_progress = threading.Event()
     vm_command_in_progress = threading.Event()
+    terminal_command_in_progress = threading.Event()
 
     def execute_command(
         command: dict[str, Any],
@@ -578,6 +608,29 @@ def main() -> None:
                 send_result(status=status, message=message, details=details)
             finally:
                 vm_command_in_progress.clear()
+            return
+
+        if command_type == "terminal_exec":
+            if terminal_command_in_progress.is_set():
+                message = "Another terminal command is already in progress"
+                log.info(f"{message} command_id={command_id}")
+                send_result(status="busy", message=message)
+                return
+
+            terminal_command_in_progress.set()
+            try:
+                command_text = command.get("command")
+                if not isinstance(command_text, str):
+                    send_result(status="failed", message="Missing terminal command text")
+                    return
+
+                log.info(f"Received terminal command command_id={command_id}")
+                send_result(status="running", message="terminal_exec started")
+                status, message, details = execute_terminal_shell(command_text)
+                log.log(logging.ERROR if status != "succeeded" else logging.INFO, f"Terminal command -> {status}: {message}")
+                send_result(status=status, message=message, details=details)
+            finally:
+                terminal_command_in_progress.clear()
             return
 
         log.info(f"Ignoring unsupported command type={command_type}")

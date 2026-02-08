@@ -12,6 +12,7 @@ import {
 import { faApple, faLinux, faWindows } from "@fortawesome/free-brands-svg-icons";
 import { useNavigate, useParams } from "react-router-dom";
 import NodeVmsPanel from "../components/NodeVmsPanel";
+import NodeTerminalPanel from "../components/NodeTerminalPanel";
 import { NodeLogRecord, NodeRecord, RuntimeMetrics } from "../types";
 import { formatTimestamp, getHeartbeatHealth } from "../utils/health";
 import { toast } from "react-toastify";
@@ -202,7 +203,7 @@ export default function NodeDetailPage({
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"main" | "stats" | "vms">("main");
+  const [activeTab, setActiveTab] = useState<"main" | "stats" | "vms" | "terminal">("main");
   const [openCreateVmIntent, setOpenCreateVmIntent] = useState(0);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -646,6 +647,15 @@ export default function NodeDetailPage({
         >
           VMs
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "terminal"}
+          className={`node-tab ${activeTab === "terminal" ? "node-tab-active" : ""}`}
+          onClick={() => setActiveTab("terminal")}
+        >
+          Terminal
+        </button>
       </div>
 
       {activeTab === "main" ? (
@@ -763,6 +773,10 @@ export default function NodeDetailPage({
           apiBaseUrl={apiBaseUrl}
           openCreateIntent={openCreateVmIntent}
         />
+      ) : null}
+
+      {activeTab === "terminal" ? (
+        <NodeTerminalPanel nodeId={node.id} apiBaseUrl={apiBaseUrl} />
       ) : null}
 
       {confirmUpdateOpen ? (

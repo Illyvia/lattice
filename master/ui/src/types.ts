@@ -101,3 +101,17 @@ export type NodeVmRecord = {
     error: string | null;
   } | null;
 };
+
+export type TerminalCommandRecord = {
+  id: string;
+  node_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  command_text: string;
+  stdout_text: string | null;
+  stderr_text: string | null;
+  exit_code: number | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  ended_at: string | null;
+};

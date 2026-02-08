@@ -21,6 +21,7 @@ if str(ROOT_DIR) not in sys.path:
 from agent.system import log_system_info
 from log_setup import setup_logger
 from master.db import (
+    apply_terminal_command_result,
     apply_vm_command_result,
     append_node_log,
     create_node,
@@ -37,7 +38,9 @@ from master.db import (
     list_vm_operations,
     list_node_logs,
     list_nodes,
+    list_terminal_commands,
     pair_node,
+    queue_terminal_command,
     queue_vm_action,
     rename_node,
     record_heartbeat,
@@ -288,6 +291,22 @@ def _process_agent_command_result(
         log.info(
             f"Agent vm command result node_id={node_id} operation_id={vm_operation_id} "
             f"type={command_type} status={status} message={message}"
+        )
+        return "ok", result
+    if command_type == "terminal_exec":
+        apply_status, result = apply_terminal_command_result(
+            DB_PATH,
+            node_id=node_id,
+            operation_id=vm_operation_id,
+            status=status,
+            message=message,
+            details=details,
+        )
+        if apply_status == "not_found":
+            return "operation_not_found", None
+        log.info(
+            f"Agent terminal command result node_id={node_id} operation_id={vm_operation_id} "
+            f"status={status} message={message}"
         )
         return "ok", result
 
@@ -656,6 +675,38 @@ def post_update_agent(node_id: str):
             "recent_heartbeat": recently_heartbeat,
         }
     ), 202
+
+
+@app.get("/api/nodes/<node_id>/terminal/commands")
+def get_node_terminal_commands(node_id: str):
+    limit = _coerce_vm_limit(request.args.get("limit"), default=100)
+    status, commands = list_terminal_commands(DB_PATH, node_id=node_id, limit=limit)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    return jsonify(commands), 200
+
+
+@app.post("/api/nodes/<node_id>/terminal/exec")
+def post_node_terminal_exec(node_id: str):
+    payload = request.get_json(silent=True) or {}
+    command_text = payload.get("command")
+    if not isinstance(command_text, str):
+        return _json_error(400, "command is required")
+
+    status, result = queue_terminal_command(DB_PATH, node_id=node_id, command_text=command_text)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "node_not_paired":
+        return _json_error(409, "node must be paired before running terminal commands")
+    if status == "invalid_payload":
+        return _json_error(400, str(result.get("error")) if isinstance(result, dict) else "invalid payload")
+
+    command = result["command"]
+    _enqueue_agent_command(node_id, command)
+    connected = _is_agent_connected(node_id)
+    command_id = command.get("command_id")
+    log.info(f"Queued terminal command node_id={node_id} command_id={command_id} connected={connected}")
+    return jsonify({"ok": True, "queued": True, "agent_connected": connected, "operation": result["operation"]}), 202
 
 
 @app.post("/api/nodes/<node_id>/commands/next")

@@ -932,6 +932,118 @@ th {
   box-shadow: var(--shadow-soft);
 }
 
+.terminal-card {
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-soft);
+}
+
+.terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.terminal-header h3 {
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminal-runner {
+  display: flex;
+  gap: 10px;
+  margin: 10px 0 12px;
+}
+
+.terminal-history {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.terminal-entry {
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  border-radius: var(--radius-md);
+  padding: 10px;
+}
+
+.terminal-entry-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.terminal-command-text {
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+}
+
+.terminal-entry-meta {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  display: inline-flex;
+  gap: 14px;
+}
+
+.terminal-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.terminal-status-queued {
+  background: #eef2ff;
+  color: #4338ca;
+}
+
+.terminal-status-running {
+  background: #fffbeb;
+  color: #ca8a04;
+}
+
+.terminal-status-succeeded {
+  background: #ecfdf3;
+  color: #16a34a;
+}
+
+.terminal-status-failed {
+  background: #fef2f2;
+  color: #dc2626;
+}
+
+.terminal-output {
+  margin: 8px 0 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  border-radius: var(--radius-sm);
+  max-height: 220px;
+  overflow: auto;
+}
+
+.terminal-output code {
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.terminal-output-error {
+  border-color: #fca5a5;
+}
+
 .log-card-header {
   display: flex;
   justify-content: space-between;

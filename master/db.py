@@ -269,6 +269,26 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_vm_operations_node_vm_created ON vm_operations (node_id, vm_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_vm_operations_status ON vm_operations (status);
+
+            CREATE TABLE IF NOT EXISTS terminal_commands (
+                id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+                command_text TEXT NOT NULL,
+                stdout_text TEXT,
+                stderr_text TEXT,
+                exit_code INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                ended_at TEXT,
+                FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_terminal_commands_node_created
+            ON terminal_commands (node_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_terminal_commands_status
+            ON terminal_commands (status);
             """
         )
         _ensure_column(conn, "nodes", "last_metrics_json", "TEXT")
@@ -1423,3 +1443,179 @@ def apply_vm_command_result(
             synthesized_operation["result_json"] = json.dumps(details_payload) if details_payload else None
             return "ok", {"operation": _to_public_vm_operation(synthesized_operation), "vm": vm_payload}
         return "ok", {"operation": _to_public_vm_operation(updated_op), "vm": vm_payload}
+
+
+def _to_public_terminal_command(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return dict(row)
+
+
+def queue_terminal_command(
+    db_path: Path,
+    node_id: str,
+    command_text: str,
+) -> tuple[str, dict[str, Any] | None]:
+    clean_node_id = (node_id or "").strip()
+    clean_command = (command_text or "").strip()
+    if not clean_node_id:
+        return "not_found", None
+    if not clean_command:
+        return "invalid_payload", {"error": "command is required"}
+    if len(clean_command) > 2000:
+        return "invalid_payload", {"error": "command is too long (max 2000 characters)"}
+
+    with _connect(db_path) as conn:
+        node_row = conn.execute("SELECT * FROM nodes WHERE id = ? LIMIT 1;", (clean_node_id,)).fetchone()
+        if node_row is None:
+            return "not_found", None
+        if node_row["state"] != NODE_STATE_PAIRED:
+            return "node_not_paired", None
+
+        command_id = str(uuid.uuid4())
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO terminal_commands (
+                id, node_id, status, command_text, stdout_text, stderr_text,
+                exit_code, error, created_at, started_at, ended_at
+            ) VALUES (?, ?, 'queued', ?, NULL, NULL, NULL, NULL, ?, NULL, NULL);
+            """,
+            (command_id, clean_node_id, clean_command, now),
+        )
+        _insert_node_log(
+            conn,
+            node_id=clean_node_id,
+            level="info",
+            message="Terminal command queued",
+            meta={"command_id": command_id, "command": clean_command},
+            created_at=now,
+        )
+        row = conn.execute("SELECT * FROM terminal_commands WHERE id = ? LIMIT 1;", (command_id,)).fetchone()
+        command = {
+            "type": "command",
+            "command_type": "terminal_exec",
+            "command_id": command_id,
+            "operation_id": command_id,
+            "created_at": now,
+            "command": clean_command,
+        }
+        return "ok", {"operation": _to_public_terminal_command(row), "command": command}
+
+
+def list_terminal_commands(
+    db_path: Path,
+    node_id: str,
+    limit: int = 100,
+) -> tuple[str, list[dict[str, Any]]]:
+    clean_node_id = (node_id or "").strip()
+    if not clean_node_id:
+        return "not_found", []
+
+    try:
+        clean_limit = int(limit)
+    except (TypeError, ValueError):
+        clean_limit = 100
+    clean_limit = max(1, min(clean_limit, 200))
+
+    with _connect(db_path) as conn:
+        node_row = conn.execute("SELECT 1 FROM nodes WHERE id = ? LIMIT 1;", (clean_node_id,)).fetchone()
+        if node_row is None:
+            return "not_found", []
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM terminal_commands
+            WHERE node_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?;
+            """,
+            (clean_node_id, clean_limit),
+        ).fetchall()
+        return "ok", [_to_public_terminal_command(row) for row in rows]
+
+
+def apply_terminal_command_result(
+    db_path: Path,
+    node_id: str,
+    operation_id: str,
+    status: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    clean_node_id = (node_id or "").strip()
+    clean_operation_id = (operation_id or "").strip()
+    clean_status = (status or "").strip().lower()
+    clean_message = (message or "").strip() or "No details provided"
+    details_payload = details if isinstance(details, dict) else {}
+    now = utc_now()
+
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM terminal_commands WHERE id = ? AND node_id = ? LIMIT 1;",
+            (clean_operation_id, clean_node_id),
+        ).fetchone()
+        if row is None:
+            return "not_found", None
+
+        if clean_status == "running":
+            conn.execute(
+                """
+                UPDATE terminal_commands
+                SET status = 'running', started_at = COALESCE(started_at, ?)
+                WHERE id = ?;
+                """,
+                (now, clean_operation_id),
+            )
+            _insert_node_log(
+                conn,
+                node_id=clean_node_id,
+                level="info",
+                message=f"Terminal command running: {row['command_text']}",
+                meta={"command_id": clean_operation_id},
+                created_at=now,
+            )
+        else:
+            final_status = "succeeded" if clean_status == "succeeded" else "failed"
+            stdout_text = details_payload.get("stdout")
+            stderr_text = details_payload.get("stderr")
+            exit_code_raw = details_payload.get("exit_code")
+            exit_code = exit_code_raw if isinstance(exit_code_raw, int) else None
+            if not isinstance(stdout_text, str):
+                stdout_text = ""
+            if not isinstance(stderr_text, str):
+                stderr_text = ""
+            conn.execute(
+                """
+                UPDATE terminal_commands
+                SET
+                    status = ?,
+                    stdout_text = ?,
+                    stderr_text = ?,
+                    exit_code = ?,
+                    error = ?,
+                    started_at = COALESCE(started_at, ?),
+                    ended_at = ?
+                WHERE id = ?;
+                """,
+                (
+                    final_status,
+                    stdout_text[:20000],
+                    stderr_text[:20000],
+                    exit_code,
+                    clean_message if final_status == "failed" else None,
+                    now,
+                    now,
+                    clean_operation_id,
+                ),
+            )
+            _insert_node_log(
+                conn,
+                node_id=clean_node_id,
+                level="info" if final_status == "succeeded" else "error",
+                message=f"Terminal command {final_status}: {row['command_text']}",
+                meta={"command_id": clean_operation_id, "exit_code": exit_code},
+                created_at=now,
+            )
+
+        updated = conn.execute("SELECT * FROM terminal_commands WHERE id = ? LIMIT 1;", (clean_operation_id,)).fetchone()
+        return "ok", _to_public_terminal_command(updated)
