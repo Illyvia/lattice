@@ -228,9 +228,15 @@ export default function App() {
       throw new Error(message);
     }
 
-    const body = (await resp.json()) as { agent_connected?: boolean };
+    const body = (await resp.json()) as {
+      agent_connected?: boolean;
+      agent_ws_connected?: boolean;
+      recent_heartbeat?: boolean;
+    };
     if (body.agent_connected === false) {
-      toast.info("Update queued. It will run when the node reconnects.");
+      toast.info("Update request accepted. It will run when the node command channel reconnects.");
+    } else if (body.agent_ws_connected === false && body.recent_heartbeat === true) {
+      toast.info("Update request accepted. Node is online and command dispatch is catching up.");
     } else {
       toast.info("Update command sent to node.");
     }

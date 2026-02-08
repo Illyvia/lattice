@@ -3,12 +3,14 @@ import json
 from datetime import datetime, timezone
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib import error, request
+from urllib.parse import quote
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 AGENT_DIR = Path(__file__).resolve().parent
@@ -193,6 +195,23 @@ def execute_agent_update(force: bool = False, branch: str | None = None) -> tupl
     if rc != 0 or inside_repo.lower() != "true":
         return "failed", "Agent is not running from a git repository", {"stderr": err}
 
+    # Fast-forward pulls frequently fail on dev nodes with local edits.
+    # Return a clear reason before attempting network operations.
+    rc, dirty_status, err = _run_git_command(["git", "status", "--porcelain"])
+    if rc != 0:
+        return "failed", "Unable to check working tree state", {"stderr": err}
+    if dirty_status.strip() and not force:
+        changed_lines = [line.strip() for line in dirty_status.splitlines() if line.strip()]
+        changed_files: list[str] = []
+        for line in changed_lines:
+            # Porcelain format is "XY <path>".
+            changed_files.append(line[3:] if len(line) > 3 else line)
+        return (
+            "failed",
+            "Working tree has local changes; commit, stash, or discard changes before update",
+            {"changed_files": changed_files[:25]},
+        )
+
     fetch_args = ["git", "fetch", "--all", "--prune"]
     if branch_name:
         fetch_args = ["git", "fetch", "origin", branch_name, "--prune"]
@@ -261,6 +280,146 @@ def execute_agent_update(force: bool = False, branch: str | None = None) -> tupl
     }
 
 
+def _build_agent_command_url(master_url: str, node_id: str, suffix: str) -> str:
+    return f"{master_url.rstrip('/')}/api/nodes/{quote(node_id)}/commands/{suffix}"
+
+
+class CommandPoller:
+    def __init__(
+        self,
+        master_url: str,
+        node_id: str,
+        pair_token: str,
+        execute_command: Callable[[dict[str, Any], Callable[..., None]], None],
+        logger=None,
+        on_auth_failure: Callable[[int | None, str], None] | None = None,
+        poll_interval_seconds: int = 2,
+        timeout_seconds: int = 10,
+    ) -> None:
+        self.master_url = master_url.rstrip("/")
+        self.node_id = node_id
+        self.pair_token = pair_token
+        self.execute_command = execute_command
+        self.logger = logger
+        self.on_auth_failure = on_auth_failure
+        self.poll_interval_seconds = max(1, poll_interval_seconds)
+        self.timeout_seconds = timeout_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="command-poller", daemon=True)
+        self._thread.start()
+        if self.logger:
+            self.logger.info("Agent command poller started")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        if self.logger:
+            self.logger.info("Agent command poller stopped")
+
+    def _post_json(self, url: str, payload: dict[str, Any]) -> tuple[bool, int | None, Any]:
+        req = request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.pair_token}",
+                "X-Agent-Hostname": socket.gethostname(),
+            },
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                status_code = resp.getcode()
+                body = resp.read().decode("utf-8", errors="replace")
+                if body.strip():
+                    try:
+                        parsed = json.loads(body)
+                    except json.JSONDecodeError:
+                        parsed = body
+                else:
+                    parsed = None
+                return True, status_code, parsed
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body) if body.strip() else {}
+            except json.JSONDecodeError:
+                parsed = body
+            return False, exc.code, parsed
+        except Exception as exc:
+            return False, None, str(exc)
+
+    def _send_result(
+        self,
+        command_id: str,
+        command_type: str,
+        status: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+        vm_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "command_id": str(command_id),
+            "command_type": str(command_type),
+            "status": str(status),
+            "message": str(message),
+        }
+        if isinstance(details, dict) and details:
+            payload["details"] = details
+        if isinstance(operation_id, str) and operation_id.strip():
+            payload["operation_id"] = operation_id.strip()
+        if isinstance(vm_id, str) and vm_id.strip():
+            payload["vm_id"] = vm_id.strip()
+
+        url = _build_agent_command_url(self.master_url, self.node_id, "result")
+        ok, status_code, response = self._post_json(url, payload)
+        if not ok and status_code in {401, 403} and self.on_auth_failure:
+            self.on_auth_failure(status_code, str(response))
+        if self.logger and (not ok):
+            self.logger.info(
+                f"Command result post failed status={status_code} details={response}"
+            )
+
+    def _run(self) -> None:
+        next_url = _build_agent_command_url(self.master_url, self.node_id, "next")
+        while not self._stop_event.is_set():
+            ok, status_code, data = self._post_json(next_url, {})
+            if ok and status_code == 204:
+                self._stop_event.wait(self.poll_interval_seconds)
+                continue
+
+            if ok and status_code == 200:
+                command = data.get("command") if isinstance(data, dict) else None
+                if isinstance(command, dict):
+                    self.execute_command(command, self._send_result)
+                    continue
+                self._stop_event.wait(self.poll_interval_seconds)
+                continue
+
+            if status_code in {401, 403} and self.on_auth_failure:
+                if self.logger:
+                    self.logger.info(
+                        f"Command poll auth failure status={status_code} details={data}"
+                    )
+                self.on_auth_failure(status_code, str(data))
+                self._stop_event.wait(self.poll_interval_seconds)
+                continue
+
+            if self.logger and status_code is not None:
+                self.logger.info(f"Command poll failed status={status_code} details={data}")
+            elif self.logger:
+                self.logger.info(f"Command poll failed details={data}")
+            self._stop_event.wait(self.poll_interval_seconds)
+
+
 def main() -> None:
     log.rawlog("""                                                                                                                              
                                         @@*                 %@@      @@-                                                      
@@ -305,12 +464,14 @@ def main() -> None:
 
     ws_streamer: AgentWebSocketStreamer | None = None
     ws_log_handler: WebSocketLogHandler | None = None
+    command_poller: CommandPoller | None = None
     update_in_progress = threading.Event()
     vm_command_in_progress = threading.Event()
 
-    def handle_ws_command(command: dict[str, Any]) -> None:
-        nonlocal ws_streamer
-
+    def execute_command(
+        command: dict[str, Any],
+        result_sender: Callable[..., None],
+    ) -> None:
         if not isinstance(command, dict):
             return
 
@@ -327,17 +488,30 @@ def main() -> None:
         if not isinstance(command_id, str) or not command_id.strip():
             command_id = "unknown"
 
+        def send_result(
+            *,
+            status: str,
+            message: str,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            try:
+                result_sender(
+                    command_id=command_id,
+                    operation_id=operation_id,
+                    vm_id=vm_id,
+                    command_type=str(command_type),
+                    status=status,
+                    message=message,
+                    details=details,
+                )
+            except Exception as exc:
+                log.info(f"Failed to send command result command_id={command_id} details={exc}")
+
         if command_type == "update_agent":
             if update_in_progress.is_set():
                 message = "Update already in progress"
                 log.info(message)
-                if ws_streamer:
-                    ws_streamer.send_command_result(
-                        command_id=command_id,
-                        command_type="update_agent",
-                        status="busy",
-                        message=message,
-                    )
+                send_result(status="busy", message=message)
                 return
 
             update_in_progress.set()
@@ -353,14 +527,7 @@ def main() -> None:
                 else:
                     log.info(f"Agent update {status} command_id={command_id} details={details}")
 
-                if ws_streamer:
-                    ws_streamer.send_command_result(
-                        command_id=command_id,
-                        command_type="update_agent",
-                        status=status,
-                        message=message,
-                        details=details,
-                    )
+                send_result(status=status, message=message, details=details)
             finally:
                 update_in_progress.clear()
             return
@@ -369,57 +536,50 @@ def main() -> None:
             if vm_command_in_progress.is_set():
                 message = "Another VM command is already in progress"
                 log.info(f"{message} command_id={command_id}")
-                if ws_streamer:
-                    ws_streamer.send_command_result(
-                        command_id=command_id,
-                        operation_id=operation_id,
-                        vm_id=vm_id,
-                        command_type=command_type,
-                        status="busy",
-                        message=message,
-                    )
+                send_result(status="busy", message=message)
                 return
 
             vm_command_in_progress.set()
             try:
                 log.info(f"Received VM command command_id={command_id} type={command_type} vm_id={vm_id}")
-                if ws_streamer:
-                    ws_streamer.send_command_result(
-                        command_id=command_id,
-                        operation_id=operation_id,
-                        vm_id=vm_id,
-                        command_type=command_type,
-                        status="running",
-                        message=f"{command_type} started",
-                    )
+                send_result(status="running", message=f"{command_type} started")
 
                 status, message, details = execute_vm_command(command)
                 level = "error" if status != "succeeded" else "info"
                 log.log(logging.ERROR if level == "error" else logging.INFO, f"VM command {command_type} -> {status}: {message}")
-                if ws_streamer:
-                    ws_streamer.send_command_result(
-                        command_id=command_id,
-                        operation_id=operation_id,
-                        vm_id=vm_id,
-                        command_type=command_type,
-                        status=status,
-                        message=message,
-                        details=details,
-                    )
+                send_result(status=status, message=message, details=details)
             finally:
                 vm_command_in_progress.clear()
             return
 
         log.info(f"Ignoring unsupported command type={command_type}")
-        if ws_streamer:
-            ws_streamer.send_command_result(
-                command_id=command_id,
-                operation_id=operation_id,
-                vm_id=vm_id,
-                command_type=str(command_type),
-                status="failed",
-                message=f"Unsupported command type: {command_type}",
-            )
+        send_result(status="failed", message=f"Unsupported command type: {command_type}")
+
+    def handle_ws_command(command: dict[str, Any]) -> None:
+        nonlocal ws_streamer
+
+        def ws_result_sender(
+            *,
+            command_id: str,
+            operation_id: str | None,
+            vm_id: str | None,
+            command_type: str,
+            status: str,
+            message: str,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            if ws_streamer:
+                ws_streamer.send_command_result(
+                    command_id=command_id,
+                    operation_id=operation_id,
+                    vm_id=vm_id,
+                    command_type=command_type,
+                    status=status,
+                    message=message,
+                    details=details,
+                )
+
+        execute_command(command, ws_result_sender)
 
     def start_ws_streamer(current_state: dict[str, str]) -> None:
         nonlocal ws_streamer, ws_log_handler
@@ -441,6 +601,24 @@ def main() -> None:
         log.addHandler(ws_log_handler)
         log.info("Agent websocket log stream started")
 
+    def start_command_poller(current_state: dict[str, str]) -> None:
+        nonlocal command_poller
+        if command_poller:
+            command_poller.stop()
+            command_poller = None
+
+        command_poller = CommandPoller(
+            master_url=config.master_url,
+            node_id=current_state["node_id"],
+            pair_token=current_state["pair_token"],
+            execute_command=execute_command,
+            logger=log,
+            on_auth_failure=on_auth_failure,
+            poll_interval_seconds=2,
+            timeout_seconds=10,
+        )
+        command_poller.start()
+
     auth_failure_event = threading.Event()
 
     def on_auth_failure(status_code: int | None, details: str) -> None:
@@ -458,6 +636,7 @@ def main() -> None:
         on_auth_failure=on_auth_failure,
     )
     start_ws_streamer(state)
+    start_command_poller(state)
     sender.start()
 
     try:
@@ -465,10 +644,14 @@ def main() -> None:
             if auth_failure_event.is_set():
                 auth_failure_event.clear()
                 sender.stop()
+                if command_poller:
+                    command_poller.stop()
+                    command_poller = None
                 clear_state(STATE_PATH)
                 log.info("Cleared local state; retrying pair flow")
                 state = pair_until_success(config)
                 start_ws_streamer(state)
+                start_command_poller(state)
                 sender = HeartbeatSender(
                     master_url=config.master_url,
                     node_id=state["node_id"],
@@ -490,6 +673,9 @@ def main() -> None:
         if ws_streamer:
             ws_streamer.stop()
             ws_streamer = None
+        if command_poller:
+            command_poller.stop()
+            command_poller = None
         sender.stop()
 
 

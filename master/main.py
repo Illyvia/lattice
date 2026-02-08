@@ -28,6 +28,7 @@ from master.db import (
     delete_node,
     fail_stale_vm_operations,
     fail_unfinished_vm_operations,
+    get_node_by_id,
     get_node_vm,
     init_db,
     is_valid_node_token,
@@ -80,7 +81,7 @@ sock = Sock(app)
 
 AGENT_COMMANDS_LOCK = threading.Lock()
 PENDING_AGENT_COMMANDS: dict[str, list[dict[str, Any]]] = {}
-CONNECTED_AGENT_NODES: set[str] = set()
+ACTIVE_AGENT_CONNECTIONS: dict[str, str] = {}
 
 
 def _utc_now() -> str:
@@ -104,17 +105,30 @@ def _dequeue_agent_command(node_id: str) -> dict[str, Any] | None:
         return command
 
 
-def _set_agent_connected(node_id: str, connected: bool) -> None:
+def _activate_agent_connection(node_id: str, connection_id: str) -> str | None:
     with AGENT_COMMANDS_LOCK:
-        if connected:
-            CONNECTED_AGENT_NODES.add(node_id)
-        else:
-            CONNECTED_AGENT_NODES.discard(node_id)
+        previous = ACTIVE_AGENT_CONNECTIONS.get(node_id)
+        ACTIVE_AGENT_CONNECTIONS[node_id] = connection_id
+        return previous
+
+
+def _is_current_agent_connection(node_id: str, connection_id: str) -> bool:
+    with AGENT_COMMANDS_LOCK:
+        return ACTIVE_AGENT_CONNECTIONS.get(node_id) == connection_id
+
+
+def _deactivate_agent_connection(node_id: str, connection_id: str) -> bool:
+    with AGENT_COMMANDS_LOCK:
+        current = ACTIVE_AGENT_CONNECTIONS.get(node_id)
+        if current != connection_id:
+            return False
+        ACTIVE_AGENT_CONNECTIONS.pop(node_id, None)
+        return True
 
 
 def _is_agent_connected(node_id: str) -> bool:
     with AGENT_COMMANDS_LOCK:
-        return node_id in CONNECTED_AGENT_NODES
+        return node_id in ACTIVE_AGENT_CONNECTIONS
 
 
 def _apply_cors_headers(response):
@@ -186,6 +200,140 @@ def _coerce_logs_limit(raw_limit: str | None, default: int = 200) -> int:
     except (TypeError, ValueError):
         value = default
     return max(1, min(value, 500))
+
+
+def _has_recent_heartbeat(last_heartbeat_at: Any, max_age_seconds: int = 45) -> bool:
+    if not isinstance(last_heartbeat_at, str) or not last_heartbeat_at.strip():
+        return False
+    raw = last_heartbeat_at.strip()
+    # Support both "+00:00" and trailing "Z" UTC formats.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+    return -5 <= age_seconds <= max_age_seconds
+
+
+def _extract_bearer_token() -> str | None:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.removeprefix("Bearer ").strip()
+    return token or None
+
+
+def _validate_agent_node_auth(node_id: str) -> tuple[str | None, tuple[dict[str, Any], int] | None]:
+    token = _extract_bearer_token()
+    if not token:
+        return None, _json_error(401, "missing bearer token")
+    if not is_valid_node_token(DB_PATH, node_id, token):
+        return None, _json_error(403, "unauthorized")
+
+    node = get_node_by_id(DB_PATH, node_id)
+    if not node:
+        return None, _json_error(404, "node not found")
+    expected_hostname = node.get("agent_hostname")
+    supplied_hostname = request.headers.get("X-Agent-Hostname", "").strip()
+    if (
+        isinstance(expected_hostname, str)
+        and expected_hostname.strip()
+        and supplied_hostname
+        and expected_hostname.strip().lower() != supplied_hostname.lower()
+    ):
+        return None, _json_error(403, "hostname mismatch")
+    return token, None
+
+
+def _process_agent_command_result(
+    *,
+    node_id: str,
+    payload: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    command_id = payload.get("command_id")
+    operation_id = payload.get("operation_id")
+    command_type = payload.get("command_type")
+    status = payload.get("status")
+    message = payload.get("message")
+    details = payload.get("details")
+
+    if not isinstance(command_id, str) or not command_id.strip():
+        return "invalid_command_id", None
+    if not isinstance(command_type, str) or not command_type.strip():
+        command_type = "unknown"
+    if not isinstance(status, str) or not status.strip():
+        status = "unknown"
+    if not isinstance(message, str) or not message.strip():
+        message = "No details provided"
+    if not isinstance(details, dict):
+        details = None
+
+    vm_operation_id = operation_id if isinstance(operation_id, str) and operation_id.strip() else command_id
+    if command_type.startswith("vm_"):
+        apply_status, result = apply_vm_command_result(
+            DB_PATH,
+            node_id=node_id,
+            operation_id=vm_operation_id,
+            command_type=command_type,
+            status=status,
+            message=message,
+            details=details,
+        )
+        if apply_status == "not_found":
+            return "operation_not_found", None
+        log.info(
+            f"Agent vm command result node_id={node_id} operation_id={vm_operation_id} "
+            f"type={command_type} status={status} message={message}"
+        )
+        return "ok", result
+
+    level = "info"
+    if status in {"failed", "error"}:
+        level = "error"
+    elif status in {"busy"}:
+        level = "warning"
+
+    detail_suffix = ""
+    if level == "error" and isinstance(details, dict):
+        detail_candidate: str | None = None
+        for key in ("stderr", "error", "stdout"):
+            value = details.get(key)
+            if isinstance(value, str) and value.strip():
+                detail_candidate = value.strip().splitlines()[0]
+                break
+        changed_files = details.get("changed_files")
+        if not detail_candidate and isinstance(changed_files, list) and changed_files:
+            first_file = changed_files[0]
+            if isinstance(first_file, str) and first_file.strip():
+                detail_candidate = f"local change: {first_file.strip()}"
+        if detail_candidate:
+            detail_suffix = f" ({detail_candidate[:180]})"
+
+    append_node_log(
+        DB_PATH,
+        node_id=node_id,
+        level=level,
+        message=f"Agent command {command_type} -> {status}: {message}{detail_suffix}",
+        meta={
+            "command_id": command_id,
+            "command_type": command_type,
+            "status": status,
+            "details": details,
+        },
+    )
+    log.info(
+        f"Agent command result node_id={node_id} command_id={command_id} "
+        f"type={command_type} status={status} message={message}"
+    )
+    return "ok", {
+        "command_id": command_id,
+        "command_type": command_type,
+        "status": status,
+    }
 
 
 @app.get("/health")
@@ -449,7 +597,7 @@ def post_heartbeat():
     status, _node = record_heartbeat(DB_PATH, pair_token, node_id, payload)
     if status in {"missing_token", "invalid_token"}:
         return _json_error(401, "invalid token")
-    if status == "node_mismatch":
+    if status in {"node_mismatch", "hostname_mismatch"}:
         return _json_error(403, "token does not match node")
 
     return jsonify({"ok": True}), 200
@@ -491,11 +639,71 @@ def post_update_agent(node_id: str):
         message="Agent update requested from UI",
         meta={"command_id": command_id, "force": force, "branch": command.get("branch")},
     )
-    connected = _is_agent_connected(node_id)
+    ws_connected = _is_agent_connected(node_id)
+    recently_heartbeat = _has_recent_heartbeat(node.get("last_heartbeat_at"))
+    connected = ws_connected or recently_heartbeat
     log.info(
-        f"Queued update command node_id={node_id} command_id={command_id} connected={connected}"
+        f"Queued update command node_id={node_id} command_id={command_id} "
+        f"connected={connected} ws_connected={ws_connected} recent_heartbeat={recently_heartbeat}"
     )
-    return jsonify({"ok": True, "command_id": command_id, "queued": True, "agent_connected": connected}), 202
+    return jsonify(
+        {
+            "ok": True,
+            "command_id": command_id,
+            "queued": True,
+            "agent_connected": connected,
+            "agent_ws_connected": ws_connected,
+            "recent_heartbeat": recently_heartbeat,
+        }
+    ), 202
+
+
+@app.post("/api/nodes/<node_id>/commands/next")
+def post_agent_next_command(node_id: str):
+    clean_node_id = (node_id or "").strip()
+    if not clean_node_id:
+        return _json_error(404, "node not found")
+
+    _, auth_error = _validate_agent_node_auth(clean_node_id)
+    if auth_error:
+        return auth_error
+
+    command = _dequeue_agent_command(clean_node_id)
+    if not command:
+        return "", 204
+
+    append_node_log(
+        DB_PATH,
+        node_id=clean_node_id,
+        level="info",
+        message=f"Dispatched agent command {command.get('command_type', 'unknown')} via polling",
+        meta={"command_id": command.get("command_id"), "command": command},
+    )
+    return jsonify({"command": command}), 200
+
+
+@app.post("/api/nodes/<node_id>/commands/result")
+def post_agent_command_result(node_id: str):
+    clean_node_id = (node_id or "").strip()
+    if not clean_node_id:
+        return _json_error(404, "node not found")
+
+    _, auth_error = _validate_agent_node_auth(clean_node_id)
+    if auth_error:
+        return auth_error
+
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return _json_error(400, "invalid payload")
+
+    status, result = _process_agent_command_result(node_id=clean_node_id, payload=payload)
+    if status == "invalid_command_id":
+        return _json_error(400, "command_id is required")
+    if status == "operation_not_found":
+        return _json_error(404, "operation_not_found")
+    if status != "ok":
+        return _json_error(500, "failed to process command result")
+    return jsonify({"ok": True, "result": result}), 200
 
 
 def _stream_node_logs_ws(ws, node_id: str, limit: int):
@@ -570,29 +778,20 @@ def ws_agent(ws):
     node_id: str | None = None
     pair_token: str | None = None
     authenticated = False
+    connection_id = str(uuid.uuid4())
 
     def send_message(payload: dict[str, Any]) -> None:
         ws.send(json.dumps(payload))
 
-    def send_pending_command() -> None:
-        if not authenticated or not node_id:
-            return
-        command = _dequeue_agent_command(node_id)
-        if not command:
-            return
-        send_message(command)
-        append_node_log(
-            DB_PATH,
-            node_id=node_id,
-            level="info",
-            message=f"Sent agent command {command.get('command_type', 'unknown')}",
-            meta={"command_id": command.get("command_id"), "command": command},
-        )
-
     try:
         while True:
-            send_pending_command()
-            raw = ws.receive()
+            if authenticated and node_id and not _is_current_agent_connection(node_id, connection_id):
+                send_message({"type": "error", "error": "superseded_connection"})
+                break
+            try:
+                raw = ws.receive(timeout=1)
+            except TimeoutError:
+                continue
             if raw is None:
                 break
 
@@ -636,14 +835,26 @@ def ws_agent(ws):
                 node_id = candidate_node_id.strip()
                 pair_token = candidate_pair_token.strip()
                 authenticated = True
-                _set_agent_connected(node_id, True)
+                previous_connection_id = _activate_agent_connection(node_id, connection_id)
+                if previous_connection_id and previous_connection_id != connection_id:
+                    append_node_log(
+                        DB_PATH,
+                        node_id=node_id,
+                        level="warning",
+                        message="Agent websocket connection replaced an existing session",
+                        meta={
+                            "previous_connection_id": previous_connection_id,
+                            "new_connection_id": connection_id,
+                        },
+                    )
                 append_node_log(
                     DB_PATH,
                     node_id=node_id,
                     level="info",
                     message="Agent websocket connected",
+                    meta={"connection_id": connection_id},
                 )
-                log.info(f"Agent websocket connected node_id={node_id}")
+                log.info(f"Agent websocket connected node_id={node_id} connection_id={connection_id}")
                 send_message({"type": "auth_ok"})
                 continue
 
@@ -693,72 +904,20 @@ def ws_agent(ws):
                     node_id=node_id or "",
                     payload=message_payload,
                 )
-                if status in {"missing_token", "invalid_token", "node_mismatch"}:
+                if status in {"missing_token", "invalid_token", "node_mismatch", "hostname_mismatch"}:
                     send_message({"type": "error", "error": "unauthorized"})
                     break
                 continue
 
             if message_type == "command_result":
-                command_id = payload.get("command_id")
-                operation_id = payload.get("operation_id")
-                command_type = payload.get("command_type")
-                status = payload.get("status")
-                message = payload.get("message")
-                details = payload.get("details")
-
-                if not isinstance(command_id, str) or not command_id.strip():
+                if not isinstance(payload, dict):
+                    send_message({"type": "error", "error": "invalid_payload"})
+                    continue
+                status, _ = _process_agent_command_result(node_id=node_id or "", payload=payload)
+                if status == "invalid_command_id":
                     send_message({"type": "error", "error": "command_id is required"})
-                    continue
-                if not isinstance(command_type, str) or not command_type.strip():
-                    command_type = "unknown"
-                if not isinstance(status, str) or not status.strip():
-                    status = "unknown"
-                if not isinstance(message, str) or not message.strip():
-                    message = "No details provided"
-                if not isinstance(details, dict):
-                    details = None
-
-                vm_operation_id = operation_id if isinstance(operation_id, str) and operation_id.strip() else command_id
-                if isinstance(command_type, str) and command_type.startswith("vm_"):
-                    apply_status, _ = apply_vm_command_result(
-                        DB_PATH,
-                        node_id=node_id or "",
-                        operation_id=vm_operation_id,
-                        command_type=command_type,
-                        status=status,
-                        message=message,
-                        details=details,
-                    )
-                    if apply_status == "not_found":
-                        send_message({"type": "error", "error": "operation_not_found"})
-                    log.info(
-                        f"Agent vm command result node_id={node_id} operation_id={vm_operation_id} "
-                        f"type={command_type} status={status} message={message}"
-                    )
-                    continue
-
-                level = "info"
-                if status in {"failed", "error"}:
-                    level = "error"
-                elif status in {"busy"}:
-                    level = "warning"
-
-                append_node_log(
-                    DB_PATH,
-                    node_id=node_id or "",
-                    level=level,
-                    message=f"Agent command {command_type} -> {status}: {message}",
-                    meta={
-                        "command_id": command_id,
-                        "command_type": command_type,
-                        "status": status,
-                        "details": details,
-                    },
-                )
-                log.info(
-                    f"Agent command result node_id={node_id} command_id={command_id} "
-                    f"type={command_type} status={status} message={message}"
-                )
+                elif status == "operation_not_found":
+                    send_message({"type": "error", "error": "operation_not_found"})
                 continue
 
             if message_type == "ping":
@@ -770,14 +929,16 @@ def ws_agent(ws):
         log.info(f"Agent websocket closed with error node_id={node_id} details={exc}")
     finally:
         if authenticated and node_id:
-            _set_agent_connected(node_id, False)
-            append_node_log(
-                DB_PATH,
-                node_id=node_id,
-                level="warning",
-                message="Agent websocket disconnected",
-            )
-            log.info(f"Agent websocket disconnected node_id={node_id}")
+            was_active = _deactivate_agent_connection(node_id, connection_id)
+            if was_active:
+                append_node_log(
+                    DB_PATH,
+                    node_id=node_id,
+                    level="warning",
+                    message="Agent websocket disconnected",
+                    meta={"connection_id": connection_id},
+                )
+                log.info(f"Agent websocket disconnected node_id={node_id} connection_id={connection_id}")
 
 
 def _serve_index():

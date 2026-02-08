@@ -565,6 +565,17 @@ def record_heartbeat(
         if row["id"] != (node_id or "").strip():
             return "node_mismatch", None
 
+        stored_hostname = row["agent_hostname"]
+        incoming_hostname = (payload or {}).get("hostname")
+        if (
+            isinstance(stored_hostname, str)
+            and stored_hostname.strip()
+            and isinstance(incoming_hostname, str)
+            and incoming_hostname.strip()
+            and stored_hostname.strip().lower() != incoming_hostname.strip().lower()
+        ):
+            return "hostname_mismatch", None
+
         last_heartbeat_at = (
             (payload or {}).get("timestamp")
             if isinstance((payload or {}).get("timestamp"), str)
