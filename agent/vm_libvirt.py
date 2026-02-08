@@ -69,6 +69,17 @@ def _looks_like_apt_lock_error(stdout: str, stderr: str) -> bool:
     return any(marker in combined for marker in lock_markers)
 
 
+def _looks_like_missing_domain_error(stdout: str, stderr: str) -> bool:
+    combined = f"{stdout}\n{stderr}".lower()
+    markers = [
+        "domain not found",
+        "failed to get domain",
+        "no domain with matching name",
+        "domain does not exist",
+    ]
+    return any(marker in combined for marker in markers)
+
+
 def _run_sudo_with_retry(
     cmd: list[str],
     timeout_seconds: int,
@@ -570,7 +581,7 @@ def execute_vm_command(command: dict[str, Any]) -> tuple[str, str, dict[str, Any
         if command_type == "vm_delete":
             _run_sudo(["virsh", "destroy", domain_name], timeout_seconds=30)
             rc, stdout, err = _run_sudo(["virsh", "undefine", domain_name, "--nvram", "--remove-all-storage"], timeout_seconds=120)
-            if rc != 0 and "domain not found" not in f"{stdout} {err}".lower():
+            if rc != 0 and not _looks_like_missing_domain_error(stdout, err):
                 return "failed", f"Unable to delete VM: {err or stdout}", {}
             if vm_id:
                 _run_sudo(["rm", "-rf", str(VM_ROOT / vm_id)], timeout_seconds=30)
