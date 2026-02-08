@@ -645,7 +645,22 @@ class TerminalSessionManager:
 
                     if not chunk:
                         break
-                    self._send_data(session_id, chunk.decode("utf-8", errors="replace"))
+
+                    # Coalesce immediate PTY bytes to reduce websocket message overhead.
+                    payload = bytearray(chunk)
+                    for _ in range(32):
+                        try:
+                            more = os.read(master_fd, 4096)
+                        except BlockingIOError:
+                            break
+                        except OSError:
+                            break
+                        if not more:
+                            break
+                        payload.extend(more)
+                        if len(payload) >= 131072:
+                            break
+                    self._send_data(session_id, payload.decode("utf-8", errors="replace"))
 
                 if process.poll() is not None:
                     break

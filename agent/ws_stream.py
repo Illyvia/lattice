@@ -348,14 +348,21 @@ class AgentWebSocketStreamer:
 
                 last_ping_at = time.monotonic()
                 while not self._stop_event.is_set():
-                    try:
-                        event = self._queue.get_nowait()
+                    sent_outbound = False
+                    # Drain a bounded batch each loop to avoid 1-message/second throttling
+                    # under high-frequency terminal output.
+                    for _ in range(200):
+                        try:
+                            event = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
                         ws.send(json.dumps(event))
-                    except queue.Empty:
-                        pass
+                        sent_outbound = True
 
                     try:
-                        inbound_raw = ws.recv(timeout_seconds=1)
+                        # Keep control-plane responsiveness without stalling outbound flush.
+                        inbound_timeout = 0.05 if sent_outbound else 1
+                        inbound_raw = ws.recv(timeout_seconds=inbound_timeout)
                         if inbound_raw:
                             inbound = json.loads(inbound_raw)
                             if (
