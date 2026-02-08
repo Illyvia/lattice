@@ -124,7 +124,27 @@ def _bridge_exists(name: str) -> bool:
 def _ensure_libvirt_default_network() -> bool:
     rc, stdout, _ = _run_sudo(["virsh", "net-info", "default"], timeout_seconds=30)
     if rc != 0:
-        return False
+        # Try defining the default network from common libvirt XML locations.
+        candidate_paths = [
+            Path("/usr/share/libvirt/networks/default.xml"),
+            Path("/etc/libvirt/qemu/networks/default.xml"),
+        ]
+        defined = False
+        for candidate in candidate_paths:
+            try:
+                if not candidate.exists():
+                    continue
+            except Exception:
+                continue
+            define_rc, _, _ = _run_sudo(["virsh", "net-define", str(candidate)], timeout_seconds=60)
+            if define_rc == 0:
+                defined = True
+                break
+        if not defined:
+            return False
+        rc, stdout, _ = _run_sudo(["virsh", "net-info", "default"], timeout_seconds=30)
+        if rc != 0:
+            return False
     lower = stdout.lower()
     if "active: yes" in lower:
         return True
@@ -140,7 +160,7 @@ def _resolve_network_argument(requested_bridge: str) -> tuple[str | None, str | 
         return f"bridge={bridge},model=virtio", None
     if _ensure_libvirt_default_network():
         return "network=default,model=virtio", f"Bridge '{bridge}' not found; using libvirt default network"
-    return None, f"Bridge '{bridge}' not found and libvirt network 'default' is unavailable"
+    return "user,model=virtio", f"Bridge '{bridge}' not found and libvirt network 'default' is unavailable; using user-mode network"
 
 
 def _resolve_osinfo_value(image: dict[str, Any]) -> str:
