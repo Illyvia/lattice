@@ -1,4 +1,5 @@
 import hashlib
+import os
 import platform
 import re
 import shutil
@@ -7,7 +8,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib import request
 
 
@@ -35,7 +36,59 @@ def _run(cmd: list[str], timeout_seconds: int = 120) -> tuple[int, str, str]:
 
 
 def _run_sudo(cmd: list[str], timeout_seconds: int = 120) -> tuple[int, str, str]:
+    # If the agent runs as root, execute directly and avoid depending on sudo.
+    if hasattr(os, "geteuid"):
+        try:
+            if os.geteuid() == 0:
+                return _run(cmd, timeout_seconds=timeout_seconds)
+        except Exception:
+            pass
     return _run(["sudo", "-n", *cmd], timeout_seconds=timeout_seconds)
+
+
+def _first_error_line(stdout: str, stderr: str) -> str:
+    for source in (stderr, stdout):
+        if not source:
+            continue
+        for raw_line in source.splitlines():
+            line = raw_line.strip()
+            if line:
+                return line
+    return "unknown error"
+
+
+def _looks_like_apt_lock_error(stdout: str, stderr: str) -> bool:
+    combined = f"{stdout}\n{stderr}".lower()
+    lock_markers = [
+        "could not get lock",
+        "unable to acquire the dpkg frontend lock",
+        "is another process using it",
+        "/var/lib/dpkg/lock",
+        "/var/lib/apt/lists/lock",
+    ]
+    return any(marker in combined for marker in lock_markers)
+
+
+def _run_sudo_with_retry(
+    cmd: list[str],
+    timeout_seconds: int,
+    retries: int,
+    retry_delay_seconds: int,
+    retry_on: Callable[[str, str], bool] | None = None,
+) -> tuple[int, str, str]:
+    attempts = max(1, retries)
+    last_rc, last_out, last_err = 1, "", "command not executed"
+    for attempt in range(1, attempts + 1):
+        rc, out, err = _run_sudo(cmd, timeout_seconds=timeout_seconds)
+        last_rc, last_out, last_err = rc, out, err
+        if rc == 0:
+            return rc, out, err
+        if attempt >= attempts:
+            break
+        if callable(retry_on) and not retry_on(out, err):
+            break
+        time.sleep(max(1, retry_delay_seconds))
+    return last_rc, last_out, last_err
 
 
 def _compute_sha256(path: Path) -> str:
@@ -98,10 +151,14 @@ def _detect_capability() -> dict[str, Any]:
 
     rc, _stdout, stderr = _run_sudo(["virsh", "list", "--all"], timeout_seconds=30)
     if rc != 0:
+        lower_err = (stderr or "").lower()
+        message = "Unable to access libvirt with sudo -n"
+        if "password is required" in lower_err or "no tty present" in lower_err or "not in the sudoers file" in lower_err:
+            message = "sudo -n denied; configure NOPASSWD sudo or install prerequisites manually"
         return {
             "provider": "libvirt",
             "ready": False,
-            "message": "Unable to access libvirt with sudo -n",
+            "message": message,
             "missing_tools": [],
             "managed_paths": [str(IMAGE_ROOT), str(VM_ROOT)],
             "details": stderr,
@@ -138,11 +195,12 @@ def _detect_linux_package_manager() -> str | None:
 
 def _install_linux_prerequisites(package_manager: str) -> tuple[bool, str, dict[str, Any]]:
     if package_manager == "apt":
-        update_cmd = ["apt-get", "update"]
+        update_cmd = ["apt-get", "-o", "Acquire::Retries=3", "update"]
         install_cmd = [
             "apt-get",
             "install",
             "-y",
+            "--no-install-recommends",
             "qemu-kvm",
             "libvirt-daemon-system",
             "libvirt-clients",
@@ -150,12 +208,26 @@ def _install_linux_prerequisites(package_manager: str) -> tuple[bool, str, dict[
             "cloud-image-utils",
             "qemu-utils",
         ]
-        rc, out, err = _run_sudo(update_cmd, timeout_seconds=1200)
+        rc, out, err = _run_sudo_with_retry(
+            update_cmd,
+            timeout_seconds=1200,
+            retries=4,
+            retry_delay_seconds=8,
+            retry_on=_looks_like_apt_lock_error,
+        )
         if rc != 0:
-            return False, "apt-get update failed", {"stdout": out, "stderr": err}
-        rc, out, err = _run_sudo(install_cmd, timeout_seconds=1800)
+            reason = _first_error_line(out, err)
+            return False, f"apt-get update failed: {reason}", {"stdout": out, "stderr": err}
+        rc, out, err = _run_sudo_with_retry(
+            install_cmd,
+            timeout_seconds=1800,
+            retries=4,
+            retry_delay_seconds=8,
+            retry_on=_looks_like_apt_lock_error,
+        )
         if rc != 0:
-            return False, "apt-get install failed", {"stdout": out, "stderr": err}
+            reason = _first_error_line(out, err)
+            return False, f"apt-get install failed: {reason}", {"stdout": out, "stderr": err}
         # Service enable/start can fail harmlessly on some distros/images.
         _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
         return True, "Installed VM prerequisites with apt", {}
@@ -173,7 +245,8 @@ def _install_linux_prerequisites(package_manager: str) -> tuple[bool, str, dict[
         ]
         rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
         if rc != 0:
-            return False, "dnf install failed", {"stdout": out, "stderr": err}
+            reason = _first_error_line(out, err)
+            return False, f"dnf install failed: {reason}", {"stdout": out, "stderr": err}
         _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
         return True, "Installed VM prerequisites with dnf", {}
 
@@ -190,7 +263,8 @@ def _install_linux_prerequisites(package_manager: str) -> tuple[bool, str, dict[
         ]
         rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
         if rc != 0:
-            return False, "yum install failed", {"stdout": out, "stderr": err}
+            reason = _first_error_line(out, err)
+            return False, f"yum install failed: {reason}", {"stdout": out, "stderr": err}
         _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
         return True, "Installed VM prerequisites with yum", {}
 
@@ -206,7 +280,8 @@ def _install_linux_prerequisites(package_manager: str) -> tuple[bool, str, dict[
         ]
         rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
         if rc != 0:
-            return False, "pacman install failed", {"stdout": out, "stderr": err}
+            reason = _first_error_line(out, err)
+            return False, f"pacman install failed: {reason}", {"stdout": out, "stderr": err}
         _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
         return True, "Installed VM prerequisites with pacman", {}
 
@@ -222,7 +297,8 @@ def _install_linux_prerequisites(package_manager: str) -> tuple[bool, str, dict[
         ]
         rc, out, err = _run_sudo(cmd, timeout_seconds=1800)
         if rc != 0:
-            return False, "zypper install failed", {"stdout": out, "stderr": err}
+            reason = _first_error_line(out, err)
+            return False, f"zypper install failed: {reason}", {"stdout": out, "stderr": err}
         _run_sudo(["systemctl", "enable", "--now", "libvirtd"], timeout_seconds=120)
         return True, "Installed VM prerequisites with zypper", {}
 

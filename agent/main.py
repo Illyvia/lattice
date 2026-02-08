@@ -445,14 +445,36 @@ def main() -> None:
 
     def bootstrap_vm_prerequisites() -> None:
         result = auto_install_vm_prerequisites(force=False)
+        details = result.get("details")
+        hint = None
+        if isinstance(details, dict):
+            stderr = str(details.get("stderr", "")).strip()
+            stdout = str(details.get("stdout", "")).strip()
+            for source in (stderr, stdout):
+                if not source:
+                    continue
+                for raw_line in source.splitlines():
+                    line = raw_line.strip()
+                    if line:
+                        hint = line
+                        break
+                if hint:
+                    break
+
         if result.get("attempted"):
             ready = bool(result.get("ready"))
-            log.info(
+            message = (
                 f"VM prerequisite auto-install attempted ready={ready} "
                 f"manager={result.get('package_manager')} message={result.get('message')}"
             )
+            if hint:
+                message = f"{message} detail={hint}"
+            log.info(message)
         else:
-            log.info(f"VM prerequisite auto-install skipped message={result.get('message')}")
+            message = f"VM prerequisite auto-install skipped message={result.get('message')}"
+            if hint:
+                message = f"{message} detail={hint}"
+            log.info(message)
 
     threading.Thread(target=bootstrap_vm_prerequisites, daemon=True).start()
 
