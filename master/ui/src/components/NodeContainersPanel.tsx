@@ -368,13 +368,17 @@ export default function NodeContainersPanel({ node, apiBaseUrl }: NodeContainers
               <th>State</th>
               <th>Image</th>
               <th>Runtime</th>
+              <th>IP</th>
+              <th>Ports</th>
               <th>Last Op</th>
               <th>Updated</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
-            {containers.map((container) => (
+            {containers.map((container) => {
+              const isRunning = container.state === "running";
+              return (
               <tr
                 key={container.id}
                 className="clickable-row"
@@ -390,6 +394,8 @@ export default function NodeContainersPanel({ node, apiBaseUrl }: NodeContainers
                 </td>
                 <td>{container.image}</td>
                 <td>{container.runtime_name}</td>
+                <td>{container.ip_address || "-"}</td>
+                <td>{container.published_ports || "-"}</td>
                 <td>
                   {container.last_operation
                     ? `${container.last_operation.operation_type}:${container.last_operation.status}`
@@ -397,28 +403,32 @@ export default function NodeContainersPanel({ node, apiBaseUrl }: NodeContainers
                 </td>
                 <td>{formatTimestamp(container.updated_at)}</td>
                 <td className="vm-actions-cell">
-                  <button
-                    type="button"
-                    className="icon-button"
-                    disabled={actionBusyKey !== null}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void runContainerAction(container, "start");
-                    }}
-                  >
-                    <FontAwesomeIcon icon={faPlay} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-button"
-                    disabled={actionBusyKey !== null}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void runContainerAction(container, "stop");
-                    }}
-                  >
-                    <FontAwesomeIcon icon={faPowerOff} />
-                  </button>
+                  {!isRunning ? (
+                    <button
+                      type="button"
+                      className="icon-button"
+                      disabled={actionBusyKey !== null}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void runContainerAction(container, "start");
+                      }}
+                    >
+                      <FontAwesomeIcon icon={faPlay} />
+                    </button>
+                  ) : null}
+                  {isRunning ? (
+                    <button
+                      type="button"
+                      className="icon-button"
+                      disabled={actionBusyKey !== null}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void runContainerAction(container, "stop");
+                      }}
+                    >
+                      <FontAwesomeIcon icon={faPowerOff} />
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="icon-button"
@@ -443,10 +453,11 @@ export default function NodeContainersPanel({ node, apiBaseUrl }: NodeContainers
                   </button>
                 </td>
               </tr>
-            ))}
+              );
+            })}
             {!loading && containers.length === 0 ? (
               <tr>
-                <td colSpan={7} className="empty">
+                <td colSpan={9} className="empty">
                   No containers yet.
                 </td>
               </tr>

@@ -134,6 +134,8 @@ export type NodeContainerRecord = {
   runtime_id: string | null;
   image: string;
   command_text: string | null;
+  ip_address: string | null;
+  published_ports: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;

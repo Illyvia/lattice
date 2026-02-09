@@ -307,6 +307,8 @@ def init_db(db_path: Path) -> None:
                 runtime_id TEXT,
                 image TEXT NOT NULL,
                 command_text TEXT,
+                ip_address TEXT,
+                published_ports TEXT,
                 last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -360,6 +362,8 @@ def init_db(db_path: Path) -> None:
         _ensure_column(conn, "nodes", "agent_commit", "TEXT")
         _ensure_column(conn, "nodes", "capabilities_json", "TEXT")
         _ensure_column(conn, "vm_images", "architecture", "TEXT")
+        _ensure_column(conn, "node_containers", "ip_address", "TEXT")
+        _ensure_column(conn, "node_containers", "published_ports", "TEXT")
         _seed_vm_images(conn)
 
 
@@ -1729,8 +1733,8 @@ def create_container_request(
             """
             INSERT INTO node_containers (
                 id, node_id, name, state, provider, runtime_name, runtime_id,
-                image, command_text, last_error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?);
+                image, command_text, ip_address, published_ports, last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, ?, ?);
             """,
             (
                 container_id,
@@ -2162,6 +2166,20 @@ def apply_container_command_result(
                             if details_payload and isinstance(details_payload.get("image"), str)
                             else container_row["image"]
                         )
+                        ip_address = (
+                            details_payload.get("ip_address")
+                            if details_payload and isinstance(details_payload.get("ip_address"), str)
+                            else None
+                            if op_type == "stop"
+                            else container_row["ip_address"]
+                        )
+                        published_ports = (
+                            details_payload.get("published_ports")
+                            if details_payload and isinstance(details_payload.get("published_ports"), str)
+                            else None
+                            if op_type == "stop"
+                            else container_row["published_ports"]
+                        )
 
                         conn.execute(
                             """
@@ -2171,11 +2189,22 @@ def apply_container_command_result(
                                 runtime_name = ?,
                                 runtime_id = ?,
                                 image = ?,
+                                ip_address = ?,
+                                published_ports = ?,
                                 last_error = NULL,
                                 updated_at = ?
                             WHERE id = ?;
                             """,
-                            (next_state, runtime_name, runtime_id, image, now, container_id),
+                            (
+                                next_state,
+                                runtime_name,
+                                runtime_id,
+                                image,
+                                ip_address,
+                                published_ports,
+                                now,
+                                container_id,
+                            ),
                         )
 
                 refreshed_container = conn.execute(

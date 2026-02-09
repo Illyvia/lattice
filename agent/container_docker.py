@@ -315,6 +315,37 @@ def _container_runtime_id(runtime_name: str) -> str | None:
     return value or None
 
 
+def _container_ip_address(runtime_name: str) -> str | None:
+    rc, stdout, _ = _run_sudo(
+        [
+            "docker",
+            "inspect",
+            "-f",
+            "{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{.IPAddress}} {{end}}{{end}}",
+            runtime_name,
+        ],
+        timeout_seconds=30,
+    )
+    if rc != 0:
+        return None
+    ips = [part.strip() for part in stdout.split() if part.strip()]
+    if not ips:
+        return None
+    deduped = list(dict.fromkeys(ips))
+    return ", ".join(deduped)
+
+
+def _container_published_ports(runtime_name: str) -> str | None:
+    rc, stdout, _ = _run_sudo(["docker", "port", runtime_name], timeout_seconds=30)
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    deduped = list(dict.fromkeys(lines))
+    return ", ".join(deduped)
+
+
 def _derive_state(runtime_state: str, fallback: str = "unknown") -> str:
     normalized = (runtime_state or "").strip().lower()
     if not normalized:
@@ -390,6 +421,8 @@ def _create_container(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         "image": image,
         "state": state,
         "runtime_state": runtime_state,
+        "ip_address": _container_ip_address(runtime_name),
+        "published_ports": _container_published_ports(runtime_name),
     }
 
 
@@ -448,6 +481,8 @@ def execute_container_command(command: dict[str, Any]) -> tuple[str, str, dict[s
                 "runtime_id": _container_runtime_id(runtime_name),
                 "state": state,
                 "runtime_state": runtime_state,
+                "ip_address": _container_ip_address(runtime_name),
+                "published_ports": _container_published_ports(runtime_name),
             }
 
         if command_type == "container_stop":
@@ -462,6 +497,8 @@ def execute_container_command(command: dict[str, Any]) -> tuple[str, str, dict[s
                 "runtime_id": _container_runtime_id(runtime_name),
                 "state": _derive_state(runtime_state, fallback="stopped"),
                 "runtime_state": runtime_state,
+                "ip_address": None,
+                "published_ports": None,
             }
 
         if command_type == "container_restart":
@@ -475,6 +512,8 @@ def execute_container_command(command: dict[str, Any]) -> tuple[str, str, dict[s
                 "runtime_id": _container_runtime_id(runtime_name),
                 "state": _derive_state(runtime_state, fallback="running"),
                 "runtime_state": runtime_state,
+                "ip_address": _container_ip_address(runtime_name),
+                "published_ports": _container_published_ports(runtime_name),
             }
 
         if command_type == "container_delete":
@@ -512,6 +551,8 @@ def execute_container_command(command: dict[str, Any]) -> tuple[str, str, dict[s
                         "runtime_state": state_raw.strip().lower(),
                         "status_text": status_raw.strip(),
                         "state": _derive_state(state_raw, fallback="unknown"),
+                        "ip_address": _container_ip_address(name_raw.strip()),
+                        "published_ports": _container_published_ports(name_raw.strip()),
                     }
                 )
             return "succeeded", "Container sync complete", {"containers": containers}

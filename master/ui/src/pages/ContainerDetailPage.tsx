@@ -50,6 +50,7 @@ export default function ContainerDetailPage({ nodes, apiBaseUrl }: ContainerDeta
     () => actionBusy !== null || !container,
     [actionBusy, container]
   );
+  const isContainerRunning = container?.state === "running";
 
   function registerPendingOperationToast(
     nextContainer: NodeContainerRecord,
@@ -349,24 +350,28 @@ export default function ContainerDetailPage({ nodes, apiBaseUrl }: ContainerDeta
           <FontAwesomeIcon icon={faArrowLeft} />
           <span>Back to Node</span>
         </button>
-        <button
-          type="button"
-          className="secondary-button"
-          disabled={containerActionsDisabled}
-          onClick={() => void runContainerAction("start")}
-        >
-          <FontAwesomeIcon icon={faPlay} />
-          <span>Start</span>
-        </button>
-        <button
-          type="button"
-          className="secondary-button"
-          disabled={containerActionsDisabled}
-          onClick={() => void runContainerAction("stop")}
-        >
-          <FontAwesomeIcon icon={faPowerOff} />
-          <span>Stop</span>
-        </button>
+        {!isContainerRunning ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={containerActionsDisabled}
+            onClick={() => void runContainerAction("start")}
+          >
+            <FontAwesomeIcon icon={faPlay} />
+            <span>Start</span>
+          </button>
+        ) : null}
+        {isContainerRunning ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={containerActionsDisabled}
+            onClick={() => void runContainerAction("stop")}
+          >
+            <FontAwesomeIcon icon={faPowerOff} />
+            <span>Stop</span>
+          </button>
+        ) : null}
         <button
           type="button"
           className="secondary-button"
@@ -449,6 +454,14 @@ export default function ContainerDetailPage({ nodes, apiBaseUrl }: ContainerDeta
                   <strong className="node-meta-value">
                     {container.runtime_id ? <code>{container.runtime_id.slice(0, 12)}</code> : "-"}
                   </strong>
+                </div>
+                <div className="node-meta-item">
+                  <span className="node-meta-label">IP Address</span>
+                  <strong className="node-meta-value">{container.ip_address || "-"}</strong>
+                </div>
+                <div className="node-meta-item">
+                  <span className="node-meta-label">Published Ports</span>
+                  <strong className="node-meta-value">{container.published_ports || "-"}</strong>
                 </div>
                 <div className="node-meta-item">
                   <span className="node-meta-label">Command</span>
