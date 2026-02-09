@@ -330,6 +330,14 @@ def _derive_state(runtime_state: str, fallback: str = "unknown") -> str:
     return fallback
 
 
+def _exited_immediately_message(runtime_state: str) -> str:
+    clean_state = (runtime_state or "unknown").strip() or "unknown"
+    return (
+        "Container exited immediately after start "
+        f"(state: {clean_state}). Set a long-running command such as 'sleep infinity'."
+    )
+
+
 def _create_container(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     container_id = str(spec.get("container_id", "")).strip()
     name = str(spec.get("name", "")).strip()
@@ -361,12 +369,26 @@ def _create_container(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
             )
 
     runtime_state = _container_state(runtime_name)
+    state = _derive_state(runtime_state, fallback="running" if start_immediately else "stopped")
+    if start_immediately and state != "running":
+        return (
+            "failed",
+            _exited_immediately_message(runtime_state),
+            {
+                "container_id": container_id,
+                "runtime_name": runtime_name,
+                "runtime_id": runtime_id or _container_runtime_id(runtime_name),
+                "image": image,
+                "state": state,
+                "runtime_state": runtime_state,
+            },
+        )
     return "succeeded", "Container created", {
         "container_id": container_id,
         "runtime_name": runtime_name,
         "runtime_id": runtime_id or _container_runtime_id(runtime_name),
         "image": image,
-        "state": _derive_state(runtime_state, fallback="running" if start_immediately else "stopped"),
+        "state": state,
         "runtime_state": runtime_state,
     }
 
@@ -407,11 +429,24 @@ def execute_container_command(command: dict[str, Any]) -> tuple[str, str, dict[s
             if rc != 0 and "already started" not in combined and "is already running" not in combined:
                 return "failed", f"Unable to start container: {_first_error_line(stdout, stderr)}", {}
             runtime_state = _container_state(runtime_name)
+            state = _derive_state(runtime_state, fallback="running")
+            if state != "running":
+                return (
+                    "failed",
+                    _exited_immediately_message(runtime_state),
+                    {
+                        "container_id": container_id,
+                        "runtime_name": runtime_name,
+                        "runtime_id": _container_runtime_id(runtime_name),
+                        "state": state,
+                        "runtime_state": runtime_state,
+                    },
+                )
             return "succeeded", "Container started", {
                 "container_id": container_id,
                 "runtime_name": runtime_name,
                 "runtime_id": _container_runtime_id(runtime_name),
-                "state": _derive_state(runtime_state, fallback="running"),
+                "state": state,
                 "runtime_state": runtime_state,
             }
 

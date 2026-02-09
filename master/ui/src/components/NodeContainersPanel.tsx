@@ -32,7 +32,7 @@ type CreateContainerForm = {
 const DEFAULT_FORM: CreateContainerForm = {
   name: "",
   image: "ubuntu:24.04",
-  command_text: "",
+  command_text: "sleep infinity",
 };
 
 type PendingContainerToast = {
