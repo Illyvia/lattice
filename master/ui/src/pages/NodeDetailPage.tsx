@@ -724,6 +724,10 @@ export default function NodeDetailPage({
                   </strong>
                 </div>
                 <div className="node-meta-item">
+                  <span className="node-meta-label">Local IP</span>
+                  <strong className="node-meta-value">{node.local_ip ?? "-"}</strong>
+                </div>
+                <div className="node-meta-item">
                   <span className="node-meta-label">Created</span>
                   <strong className="node-meta-value">{formatTimestamp(node.created_at)}</strong>
                 </div>

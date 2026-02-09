@@ -223,7 +223,8 @@ def init_db(db_path: Path) -> None:
                 agent_info_json TEXT,
                 agent_commit TEXT,
                 last_metrics_json TEXT,
-                capabilities_json TEXT
+                capabilities_json TEXT,
+                local_ip TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_nodes_state ON nodes (state);
@@ -361,6 +362,7 @@ def init_db(db_path: Path) -> None:
         _ensure_column(conn, "nodes", "last_metrics_json", "TEXT")
         _ensure_column(conn, "nodes", "agent_commit", "TEXT")
         _ensure_column(conn, "nodes", "capabilities_json", "TEXT")
+        _ensure_column(conn, "nodes", "local_ip", "TEXT")
         _ensure_column(conn, "vm_images", "architecture", "TEXT")
         _ensure_column(conn, "node_containers", "ip_address", "TEXT")
         _ensure_column(conn, "node_containers", "published_ports", "TEXT")
@@ -674,6 +676,11 @@ def record_heartbeat(
         status_value = (payload or {}).get("status")
         hostname_value = (payload or {}).get("hostname")
         extra_value = (payload or {}).get("extra")
+        local_ip_value = extra_value.get("local_ip") if isinstance(extra_value, dict) else None
+        if not isinstance(local_ip_value, str) or not local_ip_value.strip():
+            local_ip_value = None
+        else:
+            local_ip_value = local_ip_value.strip()
         usage_value = extra_value.get("usage") if isinstance(extra_value, dict) else None
         vm_capability = extra_value.get("vm") if isinstance(extra_value, dict) else None
         container_capability = extra_value.get("container") if isinstance(extra_value, dict) else None
@@ -701,14 +708,17 @@ def record_heartbeat(
                 last_heartbeat_at = ?,
                 last_metrics_json = COALESCE(?, last_metrics_json),
                 agent_commit = COALESCE(?, agent_commit),
-                capabilities_json = COALESCE(?, capabilities_json)
+                capabilities_json = COALESCE(?, capabilities_json),
+                local_ip = COALESCE(?, local_ip)
             WHERE id = ?;
             """,
-            (last_heartbeat_at, metrics_json, commit_value, capabilities_json, row["id"]),
+            (last_heartbeat_at, metrics_json, commit_value, capabilities_json, local_ip_value, row["id"]),
         )
         log_meta: dict[str, Any] = {}
         if isinstance(hostname_value, str) and hostname_value.strip():
             log_meta["hostname"] = hostname_value.strip()
+        if isinstance(local_ip_value, str) and local_ip_value:
+            log_meta["local_ip"] = local_ip_value
         if isinstance(extra_value, dict) and extra_value:
             log_meta["extra"] = extra_value
         _insert_node_log(

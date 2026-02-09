@@ -13,7 +13,7 @@ import selectors
 import struct
 from typing import Any, Callable
 from urllib import error, request
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 try:
     import fcntl
@@ -159,7 +159,108 @@ def pair_until_success(config: AgentConfig) -> dict[str, str]:
         time.sleep(config.pair_retry_seconds)
 
 
-def build_heartbeat_extra() -> dict[str, Any]:
+_LOCAL_IP_CACHE_LOCK = threading.Lock()
+_LOCAL_IP_CACHE: dict[str, Any] = {"checked_at": 0.0, "value": None, "source": None}
+
+
+def _is_valid_local_ipv4(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    ip = value.strip()
+    if not ip:
+        return False
+    if ip.startswith("127.") or ip == "0.0.0.0":
+        return False
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit():
+            return False
+        number = int(part)
+        if number < 0 or number > 255:
+            return False
+    return True
+
+
+def _extract_master_target(master_url: str | None) -> tuple[str, int] | None:
+    if not isinstance(master_url, str) or not master_url.strip():
+        return None
+    try:
+        parsed = urlparse(master_url.strip())
+    except Exception:
+        return None
+    if not parsed.hostname:
+        return None
+    host = parsed.hostname.strip()
+    if not host:
+        return None
+    if parsed.port is not None:
+        port = parsed.port
+    elif parsed.scheme.lower() == "https":
+        port = 443
+    else:
+        port = 80
+    return host, port
+
+
+def _detect_local_ip(master_url: str | None = None) -> str | None:
+    targets: list[tuple[str, int]] = []
+    master_target = _extract_master_target(master_url)
+    if master_target is not None:
+        targets.append(master_target)
+    targets.extend([("8.8.8.8", 53), ("1.1.1.1", 53)])
+
+    for host, port in targets:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect((host, port))
+                candidate = probe.getsockname()[0]
+        except Exception:
+            continue
+        if _is_valid_local_ipv4(candidate):
+            return candidate
+
+    try:
+        hostname = socket.gethostname()
+        for family, _socktype, _proto, _canonname, sockaddr in socket.getaddrinfo(
+            hostname, None, socket.AF_INET
+        ):
+            if family != socket.AF_INET:
+                continue
+            if not isinstance(sockaddr, tuple) or len(sockaddr) < 1:
+                continue
+            candidate = str(sockaddr[0])
+            if _is_valid_local_ipv4(candidate):
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _get_cached_local_ip(master_url: str | None = None, max_age_seconds: int = 120) -> str | None:
+    now = time.monotonic()
+    with _LOCAL_IP_CACHE_LOCK:
+        checked_at = float(_LOCAL_IP_CACHE.get("checked_at", 0.0))
+        cached_value = _LOCAL_IP_CACHE.get("value")
+        cached_source = _LOCAL_IP_CACHE.get("source")
+        if (
+            isinstance(cached_value, str)
+            and cached_value
+            and cached_source == master_url
+            and (now - checked_at) <= max(5, max_age_seconds)
+        ):
+            return cached_value
+
+    detected = _detect_local_ip(master_url=master_url)
+    with _LOCAL_IP_CACHE_LOCK:
+        _LOCAL_IP_CACHE["checked_at"] = now
+        _LOCAL_IP_CACHE["value"] = detected
+        _LOCAL_IP_CACHE["source"] = master_url
+    return detected
+
+
+def build_heartbeat_extra(master_url: str | None = None) -> dict[str, Any]:
     info = get_system_info()
     payload = {
         "os": info["os"],
@@ -169,6 +270,9 @@ def build_heartbeat_extra() -> dict[str, Any]:
         "vm": get_vm_capability(max_age_seconds=60),
         "container": get_container_capability(max_age_seconds=60),
     }
+    local_ip = _get_cached_local_ip(master_url=master_url, max_age_seconds=120)
+    if local_ip:
+        payload["local_ip"] = local_ip
     git_commit = get_git_commit_hash()
     if git_commit:
         payload["git_commit"] = git_commit
@@ -1405,7 +1509,7 @@ def main() -> None:
         interval_seconds=config.heartbeat_interval_seconds,
         timeout_seconds=config.heartbeat_timeout_seconds,
         logger=log,
-        extra_provider=build_heartbeat_extra,
+        extra_provider=lambda: build_heartbeat_extra(config.master_url),
         on_auth_failure=on_auth_failure,
     )
     start_ws_streamer(state)
@@ -1433,7 +1537,7 @@ def main() -> None:
                     interval_seconds=config.heartbeat_interval_seconds,
                     timeout_seconds=config.heartbeat_timeout_seconds,
                     logger=log,
-                    extra_provider=build_heartbeat_extra,
+                    extra_provider=lambda: build_heartbeat_extra(config.master_url),
                     on_auth_failure=on_auth_failure,
                 )
                 sender.start()
