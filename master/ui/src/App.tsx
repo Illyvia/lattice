@@ -5,6 +5,7 @@ import HomePage from "./pages/HomePage";
 import NewNodePage from "./pages/NewNodePage";
 import NodeDetailPage from "./pages/NodeDetailPage";
 import NodesPage from "./pages/NodesPage";
+import ContainerDetailPage from "./pages/ContainerDetailPage";
 import VmDetailPage from "./pages/VmDetailPage";
 import { NodeRecord, ThemeMode } from "./types";
 import { ToastContainer, Id as ToastId, toast } from "react-toastify";
@@ -497,6 +498,10 @@ export default function App() {
           <Route
             path="/node/:nodeId/vm/:vmId"
             element={<VmDetailPage nodes={nodes} apiBaseUrl={API_BASE_URL} />}
+          />
+          <Route
+            path="/node/:nodeId/container/:containerId"
+            element={<ContainerDetailPage nodes={nodes} apiBaseUrl={API_BASE_URL} />}
           />
           <Route path="*" element={<Navigate to="/home" replace />} />
         </Routes>

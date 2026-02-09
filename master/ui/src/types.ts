@@ -21,8 +21,16 @@ export type NodeCapabilityVm = {
   missing_tools?: string[];
 };
 
+export type NodeCapabilityContainer = {
+  provider?: string;
+  ready?: boolean;
+  message?: string;
+  missing_tools?: string[];
+};
+
 export type NodeCapabilities = {
   vm?: NodeCapabilityVm;
+  container?: NodeCapabilityContainer;
 };
 
 export type NodeRecord = {
@@ -88,6 +96,44 @@ export type NodeVmRecord = {
   disk_gb: number;
   bridge: string;
   ip_address: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  last_operation?: {
+    id: string;
+    operation_type: string;
+    status: string;
+    created_at: string;
+    started_at: string | null;
+    ended_at: string | null;
+    error: string | null;
+  } | null;
+};
+
+export type ContainerOperationRecord = {
+  id: string;
+  node_id: string;
+  container_id: string | null;
+  operation_type: "create" | "start" | "stop" | "restart" | "delete" | "sync";
+  status: "queued" | "running" | "succeeded" | "failed";
+  request: Record<string, unknown> | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  ended_at: string | null;
+};
+
+export type NodeContainerRecord = {
+  id: string;
+  node_id: string;
+  name: string;
+  state: "creating" | "running" | "stopped" | "restarting" | "deleting" | "error" | "unknown";
+  provider: string;
+  runtime_name: string;
+  runtime_id: string | null;
+  image: string;
+  command_text: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;

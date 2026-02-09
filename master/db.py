@@ -14,6 +14,7 @@ PAIR_CODE_REGEX = re.compile(r"^[A-Z0-9]{6}$")
 NODE_STATE_PENDING = "pending"
 NODE_STATE_PAIRED = "paired"
 VM_NAME_REGEX = re.compile(r"^[a-z0-9-]{3,32}$")
+CONTAINER_NAME_REGEX = re.compile(r"^[a-z0-9-]{3,32}$")
 
 _ADJECTIVES = [
     "friendly",
@@ -295,6 +296,44 @@ def init_db(db_path: Path) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_vm_operations_node_vm_created ON vm_operations (node_id, vm_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_vm_operations_status ON vm_operations (status);
+
+            CREATE TABLE IF NOT EXISTS node_containers (
+                id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'stopped', 'restarting', 'deleting', 'error', 'unknown')),
+                provider TEXT NOT NULL,
+                runtime_name TEXT NOT NULL UNIQUE,
+                runtime_id TEXT,
+                image TEXT NOT NULL,
+                command_text TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_node_containers_node_id ON node_containers (node_id);
+            CREATE INDEX IF NOT EXISTS idx_node_containers_state ON node_containers (state);
+
+            CREATE TABLE IF NOT EXISTS container_operations (
+                id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                container_id TEXT,
+                operation_type TEXT NOT NULL CHECK (operation_type IN ('create', 'start', 'stop', 'restart', 'delete', 'sync')),
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+                request_json TEXT,
+                result_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                ended_at TEXT,
+                FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY (container_id) REFERENCES node_containers(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_container_ops_node_container_created ON container_operations (node_id, container_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_container_ops_status ON container_operations (status);
 
             CREATE TABLE IF NOT EXISTS terminal_commands (
                 id TEXT PRIMARY KEY,
@@ -633,6 +672,7 @@ def record_heartbeat(
         extra_value = (payload or {}).get("extra")
         usage_value = extra_value.get("usage") if isinstance(extra_value, dict) else None
         vm_capability = extra_value.get("vm") if isinstance(extra_value, dict) else None
+        container_capability = extra_value.get("container") if isinstance(extra_value, dict) else None
         commit_value = extra_value.get("git_commit") if isinstance(extra_value, dict) else None
         if not isinstance(commit_value, str) or not commit_value.strip():
             commit_value = None
@@ -643,8 +683,13 @@ def record_heartbeat(
             runtime_metrics["updated_at"] = last_heartbeat_at
         metrics_json = json.dumps(runtime_metrics) if runtime_metrics else None
         capabilities_json = None
+        capabilities_payload: dict[str, Any] = {}
         if isinstance(vm_capability, dict):
-            capabilities_json = json.dumps({"vm": vm_capability})
+            capabilities_payload["vm"] = vm_capability
+        if isinstance(container_capability, dict):
+            capabilities_payload["container"] = container_capability
+        if capabilities_payload:
+            capabilities_json = json.dumps(capabilities_payload)
         conn.execute(
             """
             UPDATE nodes
@@ -749,6 +794,36 @@ def _fetch_latest_vm_operation(conn: sqlite3.Connection, vm_id: str) -> dict[str
     return dict(row)
 
 
+def _to_public_container_operation(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload["request"] = _safe_json_loads(payload.pop("request_json", None))
+    payload["result"] = _safe_json_loads(payload.pop("result_json", None))
+    return payload
+
+
+def _to_public_container(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    last_op_raw = payload.pop("last_operation_json", None)
+    payload["last_operation"] = _safe_json_loads(last_op_raw)
+    return payload
+
+
+def _fetch_latest_container_operation(conn: sqlite3.Connection, container_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT id, operation_type, status, created_at, started_at, ended_at, error
+        FROM container_operations
+        WHERE container_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1;
+        """,
+        (container_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
 def _node_vm_capability_ready(node_row: sqlite3.Row) -> bool:
     capabilities = _safe_json_loads(node_row["capabilities_json"])
     if not isinstance(capabilities, dict):
@@ -757,6 +832,16 @@ def _node_vm_capability_ready(node_row: sqlite3.Row) -> bool:
     if not isinstance(vm_capability, dict):
         return False
     return bool(vm_capability.get("ready") is True)
+
+
+def _node_container_capability_ready(node_row: sqlite3.Row) -> bool:
+    capabilities = _safe_json_loads(node_row["capabilities_json"])
+    if not isinstance(capabilities, dict):
+        return False
+    container_capability = capabilities.get("container")
+    if not isinstance(container_capability, dict):
+        return False
+    return bool(container_capability.get("ready") is True)
 
 
 def list_vm_images(db_path: Path) -> list[dict[str, Any]]:
@@ -1471,6 +1556,666 @@ def apply_vm_command_result(
             synthesized_operation["result_json"] = json.dumps(details_payload) if details_payload else None
             return "ok", {"operation": _to_public_vm_operation(synthesized_operation), "vm": vm_payload}
         return "ok", {"operation": _to_public_vm_operation(updated_op), "vm": vm_payload}
+
+
+def list_node_containers(db_path: Path, node_id: str) -> tuple[str, list[dict[str, Any]]]:
+    clean_node_id = (node_id or "").strip()
+    if not clean_node_id:
+        return "not_found", []
+
+    with _connect(db_path) as conn:
+        node_row = conn.execute("SELECT * FROM nodes WHERE id = ? LIMIT 1;", (clean_node_id,)).fetchone()
+        if node_row is None:
+            return "not_found", []
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM node_containers
+            WHERE node_id = ?
+            ORDER BY created_at DESC;
+            """,
+            (clean_node_id,),
+        ).fetchall()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            latest_operation = _fetch_latest_container_operation(conn, payload["id"])
+            payload["last_operation_json"] = json.dumps(latest_operation) if latest_operation else None
+            result.append(_to_public_container(payload))
+        return "ok", result
+
+
+def get_node_container(
+    db_path: Path,
+    node_id: str,
+    container_id: str,
+) -> tuple[str, dict[str, Any] | None]:
+    clean_node_id = (node_id or "").strip()
+    clean_container_id = (container_id or "").strip()
+    if not clean_node_id:
+        return "not_found", None
+    if not clean_container_id:
+        return "container_not_found", None
+
+    with _connect(db_path) as conn:
+        node_row = conn.execute("SELECT * FROM nodes WHERE id = ? LIMIT 1;", (clean_node_id,)).fetchone()
+        if node_row is None:
+            return "not_found", None
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM node_containers
+            WHERE node_id = ? AND id = ?
+            LIMIT 1;
+            """,
+            (clean_node_id, clean_container_id),
+        ).fetchone()
+        if row is None:
+            return "container_not_found", None
+
+        payload = dict(row)
+        latest_operation = _fetch_latest_container_operation(conn, payload["id"])
+        payload["last_operation_json"] = json.dumps(latest_operation) if latest_operation else None
+        return "ok", _to_public_container(payload)
+
+
+def list_container_operations(
+    db_path: Path,
+    node_id: str,
+    container_id: str,
+    limit: int = 50,
+) -> tuple[str, list[dict[str, Any]]]:
+    clean_node_id = (node_id or "").strip()
+    clean_container_id = (container_id or "").strip()
+    if not clean_node_id:
+        return "not_found", []
+    if not clean_container_id:
+        return "container_not_found", []
+
+    try:
+        clean_limit = int(limit)
+    except (TypeError, ValueError):
+        clean_limit = 50
+    clean_limit = max(1, min(clean_limit, 200))
+
+    with _connect(db_path) as conn:
+        node_row = conn.execute("SELECT * FROM nodes WHERE id = ? LIMIT 1;", (clean_node_id,)).fetchone()
+        if node_row is None:
+            return "not_found", []
+
+        container_row = conn.execute(
+            "SELECT 1 FROM node_containers WHERE id = ? AND node_id = ? LIMIT 1;",
+            (clean_container_id, clean_node_id),
+        ).fetchone()
+        if container_row is None:
+            return "container_not_found", []
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM container_operations
+            WHERE node_id = ? AND container_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?;
+            """,
+            (clean_node_id, clean_container_id, clean_limit),
+        ).fetchall()
+        return "ok", [_to_public_container_operation(row) for row in rows]
+
+
+def _parse_container_create_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    name = str(payload.get("name", "")).strip()
+    if not CONTAINER_NAME_REGEX.fullmatch(name):
+        return "container name must match ^[a-z0-9-]{3,32}$", None
+
+    image = str(payload.get("image", "")).strip()
+    if not image:
+        return "image is required", None
+
+    command_text = payload.get("command_text")
+    normalized_command = None
+    if isinstance(command_text, str):
+        normalized_command = command_text.strip() or None
+    elif command_text is not None:
+        return "command_text must be a string", None
+
+    return "", {
+        "name": name,
+        "image": image,
+        "command_text": normalized_command,
+        "start_immediately": True,
+    }
+
+
+def create_container_request(
+    db_path: Path,
+    node_id: str,
+    payload: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    clean_node_id = (node_id or "").strip()
+    if not clean_node_id:
+        return "not_found", None
+
+    validation_error, normalized = _parse_container_create_payload(payload)
+    if validation_error:
+        return "invalid_payload", {"error": validation_error}
+    assert normalized is not None
+
+    with _connect(db_path) as conn:
+        node_row = conn.execute("SELECT * FROM nodes WHERE id = ? LIMIT 1;", (clean_node_id,)).fetchone()
+        if node_row is None:
+            return "not_found", None
+        if node_row["state"] != NODE_STATE_PAIRED:
+            return "node_not_paired", None
+        if not _node_container_capability_ready(node_row):
+            return "capability_not_ready", None
+
+        existing = conn.execute(
+            "SELECT 1 FROM node_containers WHERE node_id = ? AND name = ? LIMIT 1;",
+            (clean_node_id, normalized["name"]),
+        ).fetchone()
+        if existing is not None:
+            return "conflict", {"error": "container name already exists on this node"}
+
+        container_id = str(uuid.uuid4())
+        operation_id = str(uuid.uuid4())
+        now = utc_now()
+        runtime_name = f"lattice-{container_id.replace('-', '')[:10]}"
+
+        conn.execute(
+            """
+            INSERT INTO node_containers (
+                id, node_id, name, state, provider, runtime_name, runtime_id,
+                image, command_text, last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?);
+            """,
+            (
+                container_id,
+                clean_node_id,
+                normalized["name"],
+                "creating",
+                "docker",
+                runtime_name,
+                normalized["image"],
+                normalized["command_text"],
+                now,
+                now,
+            ),
+        )
+
+        request_payload = {
+            "name": normalized["name"],
+            "runtime_name": runtime_name,
+            "image": normalized["image"],
+            "command_text": normalized["command_text"],
+            "start_immediately": True,
+        }
+        conn.execute(
+            """
+            INSERT INTO container_operations (
+                id, node_id, container_id, operation_type, status,
+                request_json, result_json, error,
+                created_at, started_at, ended_at
+            ) VALUES (?, ?, ?, 'create', 'queued', ?, NULL, NULL, ?, NULL, NULL);
+            """,
+            (
+                operation_id,
+                clean_node_id,
+                container_id,
+                json.dumps(request_payload),
+                now,
+            ),
+        )
+
+        _insert_node_log(
+            conn,
+            node_id=clean_node_id,
+            level="info",
+            message=f"Container create queued name={normalized['name']} container_id={container_id}",
+            meta={"operation_id": operation_id, "container_id": container_id},
+        )
+
+        container_row = conn.execute(
+            "SELECT * FROM node_containers WHERE id = ? LIMIT 1;",
+            (container_id,),
+        ).fetchone()
+        op_row = conn.execute(
+            "SELECT * FROM container_operations WHERE id = ? LIMIT 1;",
+            (operation_id,),
+        ).fetchone()
+
+        command = {
+            "type": "command",
+            "command_type": "container_create",
+            "command_id": operation_id,
+            "operation_id": operation_id,
+            "container_id": container_id,
+            "created_at": now,
+            "spec": {
+                "container_id": container_id,
+                "name": normalized["name"],
+                "runtime_name": runtime_name,
+                "image": normalized["image"],
+                "command_text": normalized["command_text"],
+                "start_immediately": True,
+            },
+        }
+
+        return "ok", {
+            "container": _to_public_container(container_row),
+            "operation": _to_public_container_operation(op_row),
+            "command": command,
+        }
+
+
+def queue_container_action(
+    db_path: Path,
+    node_id: str,
+    container_id: str,
+    action: str,
+) -> tuple[str, dict[str, Any] | None]:
+    clean_node_id = (node_id or "").strip()
+    clean_container_id = (container_id or "").strip()
+    action_name = (action or "").strip().lower()
+    if action_name not in {"start", "stop", "restart", "delete"}:
+        return "invalid_action", None
+
+    with _connect(db_path) as conn:
+        node_row = conn.execute("SELECT * FROM nodes WHERE id = ? LIMIT 1;", (clean_node_id,)).fetchone()
+        if node_row is None:
+            return "not_found", None
+        if node_row["state"] != NODE_STATE_PAIRED:
+            return "node_not_paired", None
+        if not _node_container_capability_ready(node_row):
+            return "capability_not_ready", None
+
+        container_row = conn.execute(
+            "SELECT * FROM node_containers WHERE id = ? AND node_id = ? LIMIT 1;",
+            (clean_container_id, clean_node_id),
+        ).fetchone()
+        if container_row is None:
+            return "container_not_found", None
+
+        current_state = str(container_row["state"])
+        if action_name == "start" and current_state == "running":
+            return "invalid_state", {"error": "container is already running"}
+        if action_name == "stop" and current_state == "stopped":
+            return "invalid_state", {"error": "container is already stopped"}
+        if action_name == "restart" and current_state not in {"running", "unknown"}:
+            return "invalid_state", {"error": "container must be running to restart"}
+        if current_state in {"creating", "deleting"}:
+            return "invalid_state", {"error": f"container is currently {current_state}"}
+
+        operation_id = str(uuid.uuid4())
+        now = utc_now()
+        if action_name == "restart":
+            next_state = "restarting"
+        elif action_name == "delete":
+            next_state = "deleting"
+        else:
+            next_state = "unknown"
+
+        conn.execute(
+            """
+            UPDATE node_containers
+            SET state = ?, last_error = NULL, updated_at = ?
+            WHERE id = ?;
+            """,
+            (next_state, now, clean_container_id),
+        )
+
+        request_payload = {
+            "action": action_name,
+            "runtime_name": container_row["runtime_name"],
+            "container_id": clean_container_id,
+        }
+        conn.execute(
+            """
+            INSERT INTO container_operations (
+                id, node_id, container_id, operation_type, status,
+                request_json, result_json, error,
+                created_at, started_at, ended_at
+            ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL);
+            """,
+            (
+                operation_id,
+                clean_node_id,
+                clean_container_id,
+                action_name,
+                json.dumps(request_payload),
+                now,
+            ),
+        )
+
+        _insert_node_log(
+            conn,
+            node_id=clean_node_id,
+            level="info",
+            message=f"Container {action_name} queued container_id={clean_container_id}",
+            meta={"operation_id": operation_id, "container_id": clean_container_id},
+        )
+
+        refreshed_container = conn.execute(
+            "SELECT * FROM node_containers WHERE id = ? LIMIT 1;",
+            (clean_container_id,),
+        ).fetchone()
+        op_row = conn.execute(
+            "SELECT * FROM container_operations WHERE id = ? LIMIT 1;",
+            (operation_id,),
+        ).fetchone()
+
+        command = {
+            "type": "command",
+            "command_type": f"container_{action_name}",
+            "command_id": operation_id,
+            "operation_id": operation_id,
+            "container_id": clean_container_id,
+            "created_at": now,
+            "runtime_name": container_row["runtime_name"],
+            "container_spec": {
+                "container_id": clean_container_id,
+                "runtime_name": container_row["runtime_name"],
+            },
+        }
+
+        return "ok", {
+            "container": _to_public_container(refreshed_container),
+            "operation": _to_public_container_operation(op_row),
+            "command": command,
+        }
+
+
+def _derive_container_state(value: Any, fallback: str = "unknown") -> str:
+    if not isinstance(value, str):
+        return fallback
+    normalized = value.strip().lower()
+    if "running" in normalized:
+        return "running"
+    if "restarting" in normalized:
+        return "restarting"
+    if any(token in normalized for token in {"exited", "created", "stopped", "dead"}):
+        return "stopped"
+    if any(token in normalized for token in {"removing", "deleting"}):
+        return "deleting"
+    return fallback
+
+
+def fail_unfinished_container_operations(db_path: Path, reason: str) -> int:
+    now = utc_now()
+    updated_count = 0
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM container_operations
+            WHERE status IN ('queued', 'running');
+            """
+        ).fetchall()
+
+        for row in rows:
+            conn.execute(
+                """
+                UPDATE container_operations
+                SET status = 'failed', error = ?, ended_at = ?, started_at = COALESCE(started_at, ?)
+                WHERE id = ?;
+                """,
+                (reason, now, now, row["id"]),
+            )
+            if row["container_id"]:
+                conn.execute(
+                    """
+                    UPDATE node_containers
+                    SET state = 'error', last_error = ?, updated_at = ?
+                    WHERE id = ?;
+                    """,
+                    (reason, now, row["container_id"]),
+                )
+            _insert_node_log(
+                conn,
+                node_id=row["node_id"],
+                level="error",
+                message=f"Container operation {row['operation_type']} failed after restart",
+                meta={"operation_id": row["id"], "reason": reason, "container_id": row["container_id"]},
+                created_at=now,
+            )
+            updated_count += 1
+    return updated_count
+
+
+def fail_stale_container_operations(db_path: Path, stale_after_seconds: int = 600) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(60, stale_after_seconds))
+    now = utc_now()
+    updated_count = 0
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM container_operations
+            WHERE status = 'queued';
+            """
+        ).fetchall()
+
+        for row in rows:
+            created_raw = row["created_at"]
+            try:
+                created_at = datetime.fromisoformat(created_raw)
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            if created_at >= cutoff:
+                continue
+
+            reason = "Timed out waiting for agent connection"
+            conn.execute(
+                """
+                UPDATE container_operations
+                SET status = 'failed', error = ?, ended_at = ?, started_at = COALESCE(started_at, ?)
+                WHERE id = ?;
+                """,
+                (reason, now, now, row["id"]),
+            )
+            if row["container_id"]:
+                conn.execute(
+                    """
+                    UPDATE node_containers
+                    SET state = 'error', last_error = ?, updated_at = ?
+                    WHERE id = ?;
+                    """,
+                    (reason, now, row["container_id"]),
+                )
+            _insert_node_log(
+                conn,
+                node_id=row["node_id"],
+                level="error",
+                message=f"Container operation {row['operation_type']} timed out",
+                meta={"operation_id": row["id"], "container_id": row["container_id"]},
+                created_at=now,
+            )
+            updated_count += 1
+    return updated_count
+
+
+def apply_container_command_result(
+    db_path: Path,
+    node_id: str,
+    operation_id: str,
+    command_type: str,
+    status: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    clean_node_id = (node_id or "").strip()
+    clean_operation_id = (operation_id or "").strip()
+    clean_status = (status or "").strip().lower()
+    clean_message = (message or "").strip() or "No details provided"
+    details_payload = details if isinstance(details, dict) else None
+    now = utc_now()
+
+    with _connect(db_path) as conn:
+        op_row = conn.execute(
+            "SELECT * FROM container_operations WHERE id = ? AND node_id = ? LIMIT 1;",
+            (clean_operation_id, clean_node_id),
+        ).fetchone()
+        if op_row is None:
+            return "not_found", None
+        original_op_payload = dict(op_row)
+
+        if clean_status == "running":
+            conn.execute(
+                """
+                UPDATE container_operations
+                SET status = 'running', started_at = COALESCE(started_at, ?)
+                WHERE id = ?;
+                """,
+                (now, clean_operation_id),
+            )
+            _insert_node_log(
+                conn,
+                node_id=clean_node_id,
+                level="info",
+                message=f"Container operation running: {op_row['operation_type']} ({clean_message})",
+                meta={"operation_id": clean_operation_id, "container_id": op_row["container_id"], "details": details_payload},
+                created_at=now,
+            )
+            updated_op = conn.execute(
+                "SELECT * FROM container_operations WHERE id = ? LIMIT 1;",
+                (clean_operation_id,),
+            ).fetchone()
+            return "ok", _to_public_container_operation(updated_op)
+
+        final_status = "succeeded" if clean_status == "succeeded" else "failed"
+        op_type = str(op_row["operation_type"])
+        container_id = op_row["container_id"]
+
+        conn.execute(
+            """
+            UPDATE container_operations
+            SET
+                status = ?,
+                started_at = COALESCE(started_at, ?),
+                ended_at = ?,
+                error = ?,
+                result_json = ?
+            WHERE id = ?;
+            """,
+            (
+                final_status,
+                now,
+                now,
+                clean_message if final_status == "failed" else None,
+                json.dumps(details_payload) if details_payload else None,
+                clean_operation_id,
+            ),
+        )
+
+        container_payload: dict[str, Any] | None = None
+        if container_id:
+            container_row = conn.execute(
+                "SELECT * FROM node_containers WHERE id = ? LIMIT 1;",
+                (container_id,),
+            ).fetchone()
+            if container_row is not None:
+                if final_status == "failed":
+                    conn.execute(
+                        """
+                        UPDATE node_containers
+                        SET state = 'error', last_error = ?, updated_at = ?
+                        WHERE id = ?;
+                        """,
+                        (clean_message, now, container_id),
+                    )
+                else:
+                    if op_type == "delete":
+                        conn.execute("DELETE FROM node_containers WHERE id = ?;", (container_id,))
+                    else:
+                        runtime_state = (
+                            details_payload.get("state")
+                            if details_payload and isinstance(details_payload.get("state"), str)
+                            else details_payload.get("runtime_state")
+                            if details_payload and isinstance(details_payload.get("runtime_state"), str)
+                            else None
+                        )
+                        if op_type in {"create", "start", "restart"}:
+                            next_state = _derive_container_state(runtime_state, fallback="running")
+                        elif op_type == "stop":
+                            next_state = "stopped"
+                        else:
+                            next_state = "unknown"
+
+                        runtime_id = (
+                            details_payload.get("runtime_id")
+                            if details_payload and isinstance(details_payload.get("runtime_id"), str)
+                            else container_row["runtime_id"]
+                        )
+                        runtime_name = (
+                            details_payload.get("runtime_name")
+                            if details_payload and isinstance(details_payload.get("runtime_name"), str)
+                            else container_row["runtime_name"]
+                        )
+                        image = (
+                            details_payload.get("image")
+                            if details_payload and isinstance(details_payload.get("image"), str)
+                            else container_row["image"]
+                        )
+
+                        conn.execute(
+                            """
+                            UPDATE node_containers
+                            SET
+                                state = ?,
+                                runtime_name = ?,
+                                runtime_id = ?,
+                                image = ?,
+                                last_error = NULL,
+                                updated_at = ?
+                            WHERE id = ?;
+                            """,
+                            (next_state, runtime_name, runtime_id, image, now, container_id),
+                        )
+
+                refreshed_container = conn.execute(
+                    "SELECT * FROM node_containers WHERE id = ? LIMIT 1;",
+                    (container_id,),
+                ).fetchone()
+                if refreshed_container is not None:
+                    payload = dict(refreshed_container)
+                    latest_operation = _fetch_latest_container_operation(conn, container_id)
+                    payload["last_operation_json"] = json.dumps(latest_operation) if latest_operation else None
+                    container_payload = _to_public_container(payload)
+
+        level = "info" if final_status == "succeeded" else "error"
+        _insert_node_log(
+            conn,
+            node_id=clean_node_id,
+            level=level,
+            message=f"Container operation {op_type} {final_status}: {clean_message}",
+            meta={
+                "operation_id": clean_operation_id,
+                "container_id": container_id,
+                "command_type": command_type,
+                "details": details_payload,
+            },
+            created_at=now,
+        )
+
+        updated_op = conn.execute(
+            "SELECT * FROM container_operations WHERE id = ? LIMIT 1;",
+            (clean_operation_id,),
+        ).fetchone()
+        if updated_op is None:
+            synthesized_operation = dict(original_op_payload)
+            synthesized_operation["status"] = final_status
+            synthesized_operation["started_at"] = original_op_payload.get("started_at") or now
+            synthesized_operation["ended_at"] = now
+            synthesized_operation["error"] = clean_message if final_status == "failed" else None
+            synthesized_operation["result_json"] = json.dumps(details_payload) if details_payload else None
+            return "ok", {"operation": _to_public_container_operation(synthesized_operation), "container": container_payload}
+        return "ok", {"operation": _to_public_container_operation(updated_op), "container": container_payload}
 
 
 def _to_public_terminal_command(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:

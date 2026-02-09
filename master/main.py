@@ -22,18 +22,25 @@ if str(ROOT_DIR) not in sys.path:
 from agent.system import log_system_info
 from log_setup import setup_logger
 from master.db import (
+    apply_container_command_result,
     apply_terminal_command_result,
     apply_vm_command_result,
     append_node_log,
+    create_container_request,
     create_node,
     create_vm_request,
     delete_node,
+    fail_stale_container_operations,
+    fail_unfinished_container_operations,
     fail_stale_vm_operations,
     fail_unfinished_vm_operations,
     get_node_by_id,
+    get_node_container,
     get_node_vm,
     init_db,
     is_valid_node_token,
+    list_container_operations,
+    list_node_containers,
     list_node_vms,
     list_vm_images,
     list_vm_operations,
@@ -41,6 +48,7 @@ from master.db import (
     list_nodes,
     list_terminal_commands,
     pair_node,
+    queue_container_action,
     queue_terminal_command,
     queue_vm_action,
     rename_node,
@@ -79,6 +87,14 @@ failed_after_restart = fail_unfinished_vm_operations(
 )
 if failed_after_restart > 0:
     log.info(f"Marked {failed_after_restart} stale VM operations as failed after restart")
+failed_container_after_restart = fail_unfinished_container_operations(
+    DB_PATH,
+    reason="Master restarted before operation dispatch",
+)
+if failed_container_after_restart > 0:
+    log.info(
+        f"Marked {failed_container_after_restart} stale container operations as failed after restart"
+    )
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -167,15 +183,20 @@ def _clear_agent_ws_messages(node_id: str) -> None:
 def _register_terminal_session(
     node_id: str,
     vm_id: str | None = None,
+    container_id: str | None = None,
     terminal_kind: str = "node_shell",
 ) -> tuple[str, queue.Queue[dict[str, Any]]]:
     session_id = str(uuid.uuid4())
     incoming_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
     normalized_vm_id = vm_id.strip() if isinstance(vm_id, str) and vm_id.strip() else None
+    normalized_container_id = (
+        container_id.strip() if isinstance(container_id, str) and container_id.strip() else None
+    )
     with TERMINAL_SESSIONS_LOCK:
         TERMINAL_SESSIONS[session_id] = {
             "node_id": node_id,
             "vm_id": normalized_vm_id,
+            "container_id": normalized_container_id,
             "kind": terminal_kind,
             "queue": incoming_queue,
         }
@@ -391,6 +412,23 @@ def _process_agent_command_result(
             f"type={command_type} status={status} message={message}"
         )
         return "ok", result
+    if command_type.startswith("container_"):
+        apply_status, result = apply_container_command_result(
+            DB_PATH,
+            node_id=node_id,
+            operation_id=vm_operation_id,
+            command_type=command_type,
+            status=status,
+            message=message,
+            details=details,
+        )
+        if apply_status == "not_found":
+            return "operation_not_found", None
+        log.info(
+            f"Agent container command result node_id={node_id} operation_id={vm_operation_id} "
+            f"type={command_type} status={status} message={message}"
+        )
+        return "ok", result
     if command_type == "terminal_exec":
         apply_status, result = apply_terminal_command_result(
             DB_PATH,
@@ -461,6 +499,7 @@ def health():
 @app.get("/api/nodes")
 def get_nodes():
     fail_stale_vm_operations(DB_PATH)
+    fail_stale_container_operations(DB_PATH)
     return jsonify(list_nodes(DB_PATH)), 200
 
 
@@ -591,6 +630,144 @@ def post_node_vm_reboot(node_id: str, vm_id: str):
 @app.post("/api/nodes/<node_id>/vms/<vm_id>/actions/delete")
 def post_node_vm_delete(node_id: str, vm_id: str):
     return _queue_vm_action_route(node_id=node_id, vm_id=vm_id, action="delete")
+
+
+@app.get("/api/nodes/<node_id>/containers")
+def get_node_containers(node_id: str):
+    fail_stale_container_operations(DB_PATH)
+    status, containers = list_node_containers(DB_PATH, node_id=node_id)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    return jsonify(containers), 200
+
+
+@app.get("/api/nodes/<node_id>/containers/<container_id>")
+def get_node_container_route(node_id: str, container_id: str):
+    status, container = get_node_container(DB_PATH, node_id=node_id, container_id=container_id)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "container_not_found":
+        return _json_error(404, "container not found")
+    return jsonify(container), 200
+
+
+@app.get("/api/nodes/<node_id>/containers/<container_id>/operations")
+def get_node_container_operations(node_id: str, container_id: str):
+    limit = _coerce_vm_limit(request.args.get("limit"))
+    status, operations = list_container_operations(
+        DB_PATH,
+        node_id=node_id,
+        container_id=container_id,
+        limit=limit,
+    )
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "container_not_found":
+        return _json_error(404, "container not found")
+    return jsonify(operations), 200
+
+
+@app.post("/api/nodes/<node_id>/containers")
+def post_node_container(node_id: str):
+    payload = request.get_json(silent=True) or {}
+    status, result = create_container_request(DB_PATH, node_id=node_id, payload=payload)
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "node_not_paired":
+        return _json_error(409, "node must be paired before creating containers")
+    if status == "capability_not_ready":
+        return _json_error(409, "node container capability is not ready")
+    if status == "invalid_payload":
+        return _json_error(400, str(result.get("error")) if isinstance(result, dict) else "invalid payload")
+    if status == "conflict":
+        return _json_error(409, str(result.get("error")) if isinstance(result, dict) else "container conflict")
+
+    command = result["command"]
+    _enqueue_agent_command(node_id, command)
+    connected = _is_agent_connected(node_id)
+    operation_id = command.get("operation_id")
+    container_id = command.get("container_id")
+    log.info(
+        f"Queued container_create node_id={node_id} operation_id={operation_id} "
+        f"container_id={container_id} connected={connected}"
+    )
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "queued": True,
+                "agent_connected": connected,
+                "container": result["container"],
+                "operation": result["operation"],
+            }
+        ),
+        202,
+    )
+
+
+def _queue_container_action_route(node_id: str, container_id: str, action: str):
+    status, result = queue_container_action(
+        DB_PATH,
+        node_id=node_id,
+        container_id=container_id,
+        action=action,
+    )
+    if status == "not_found":
+        return _json_error(404, "node not found")
+    if status == "container_not_found":
+        return _json_error(404, "container not found")
+    if status == "node_not_paired":
+        return _json_error(409, "node must be paired before container actions")
+    if status == "capability_not_ready":
+        return _json_error(409, "node container capability is not ready")
+    if status == "invalid_state":
+        return _json_error(
+            409,
+            str(result.get("error")) if isinstance(result, dict) else "invalid container state",
+        )
+    if status == "invalid_action":
+        return _json_error(400, "invalid action")
+
+    command = result["command"]
+    _enqueue_agent_command(node_id, command)
+    connected = _is_agent_connected(node_id)
+    operation_id = command.get("operation_id")
+    log.info(
+        f"Queued container_{action} node_id={node_id} container_id={container_id} "
+        f"operation_id={operation_id} connected={connected}"
+    )
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "queued": True,
+                "agent_connected": connected,
+                "container": result["container"],
+                "operation": result["operation"],
+            }
+        ),
+        202,
+    )
+
+
+@app.post("/api/nodes/<node_id>/containers/<container_id>/actions/start")
+def post_node_container_start(node_id: str, container_id: str):
+    return _queue_container_action_route(node_id=node_id, container_id=container_id, action="start")
+
+
+@app.post("/api/nodes/<node_id>/containers/<container_id>/actions/stop")
+def post_node_container_stop(node_id: str, container_id: str):
+    return _queue_container_action_route(node_id=node_id, container_id=container_id, action="stop")
+
+
+@app.post("/api/nodes/<node_id>/containers/<container_id>/actions/restart")
+def post_node_container_restart(node_id: str, container_id: str):
+    return _queue_container_action_route(node_id=node_id, container_id=container_id, action="restart")
+
+
+@app.post("/api/nodes/<node_id>/containers/<container_id>/actions/delete")
+def post_node_container_delete(node_id: str, container_id: str):
+    return _queue_container_action_route(node_id=node_id, container_id=container_id, action="delete")
 
 
 @app.get("/api/nodes/<node_id>/logs")
@@ -1242,6 +1419,344 @@ def ws_vm_terminal(ws, node_id: str, vm_id: str):
             level="info",
             message="VM terminal session closed",
             meta={"session_id": session_id, "vm_id": clean_vm_id, "domain_name": domain_name},
+        )
+
+
+@sock.route("/ws/nodes/<node_id>/containers/<container_id>/terminal")
+def ws_container_terminal(ws, node_id: str, container_id: str):
+    clean_node_id = (node_id or "").strip()
+    clean_container_id = (container_id or "").strip()
+    if not clean_node_id:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if not clean_container_id:
+        ws.send(json.dumps({"type": "terminal_error", "error": "container_not_found"}))
+        return
+
+    node = get_node_by_id(DB_PATH, clean_node_id)
+    if not node:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if node.get("state") != "paired":
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_paired"}))
+        return
+
+    container_status, container = get_node_container(
+        DB_PATH,
+        node_id=clean_node_id,
+        container_id=clean_container_id,
+    )
+    if container_status == "not_found":
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if container_status == "container_not_found" or not isinstance(container, dict):
+        ws.send(json.dumps({"type": "terminal_error", "error": "container_not_found"}))
+        return
+
+    runtime_name = str(container.get("runtime_name") or "").strip()
+    if not runtime_name:
+        ws.send(json.dumps({"type": "terminal_error", "error": "container_runtime_missing"}))
+        return
+
+    query_string = ""
+    environ = getattr(ws, "environ", None)
+    if isinstance(environ, dict):
+        query_string = str(environ.get("QUERY_STRING", ""))
+    query = parse_qs(query_string)
+
+    cols = _coerce_terminal_size((query.get("cols") or [80])[0], default_value=80, min_value=20, max_value=300)
+    rows = _coerce_terminal_size((query.get("rows") or [24])[0], default_value=24, min_value=5, max_value=120)
+
+    session_id, inbound_queue = _register_terminal_session(
+        clean_node_id,
+        container_id=clean_container_id,
+        terminal_kind="container_terminal",
+    )
+    _enqueue_agent_ws_message(
+        clean_node_id,
+        {
+            "type": "container_terminal_open",
+            "session_id": session_id,
+            "container_id": clean_container_id,
+            "runtime_name": runtime_name,
+            "cols": cols,
+            "rows": rows,
+        },
+    )
+    if not _is_agent_connected(clean_node_id):
+        try:
+            inbound_queue.put_nowait(
+                {
+                    "type": "terminal_data",
+                    "session_id": session_id,
+                    "data": "\r\n[waiting for agent websocket connection...]\r\n",
+                }
+            )
+        except queue.Full:
+            pass
+
+    append_node_log(
+        DB_PATH,
+        node_id=clean_node_id,
+        level="info",
+        message="Container terminal session opened",
+        meta={
+            "session_id": session_id,
+            "container_id": clean_container_id,
+            "runtime_name": runtime_name,
+        },
+    )
+
+    ws.send(json.dumps({"type": "terminal_ready", "session_id": session_id}))
+
+    try:
+        while True:
+            while True:
+                try:
+                    outbound = inbound_queue.get_nowait()
+                except queue.Empty:
+                    break
+                ws.send(json.dumps(outbound))
+
+            try:
+                raw = ws.receive(timeout=0.2)
+            except Exception as exc:
+                if _is_ws_receive_timeout(exc):
+                    continue
+                raise
+            if raw is None:
+                continue
+
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_json"}))
+                continue
+
+            if not isinstance(payload, dict):
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_payload"}))
+                continue
+
+            message_type = payload.get("type")
+            if message_type == "input":
+                data = payload.get("data")
+                if not isinstance(data, str):
+                    continue
+                _enqueue_agent_ws_message(
+                    clean_node_id,
+                    {
+                        "type": "container_terminal_input",
+                        "session_id": session_id,
+                        "container_id": clean_container_id,
+                        "data": data,
+                    },
+                )
+                continue
+
+            if message_type == "resize":
+                new_cols = _coerce_terminal_size(payload.get("cols"), default_value=cols, min_value=20, max_value=300)
+                new_rows = _coerce_terminal_size(payload.get("rows"), default_value=rows, min_value=5, max_value=120)
+                cols = new_cols
+                rows = new_rows
+                _enqueue_agent_ws_message(
+                    clean_node_id,
+                    {
+                        "type": "container_terminal_resize",
+                        "session_id": session_id,
+                        "container_id": clean_container_id,
+                        "cols": new_cols,
+                        "rows": new_rows,
+                    },
+                )
+                continue
+
+            if message_type == "ping":
+                ws.send(json.dumps({"type": "pong"}))
+                continue
+
+            if message_type == "close":
+                break
+    except Exception as exc:
+        log.info(
+            f"Container terminal websocket closed node_id={clean_node_id} container_id={clean_container_id} "
+            f"session_id={session_id} details={exc}"
+        )
+    finally:
+        _unregister_terminal_session(session_id)
+        _enqueue_agent_ws_message(
+            clean_node_id,
+            {
+                "type": "container_terminal_close",
+                "session_id": session_id,
+                "container_id": clean_container_id,
+            },
+        )
+        append_node_log(
+            DB_PATH,
+            node_id=clean_node_id,
+            level="info",
+            message="Container terminal session closed",
+            meta={
+                "session_id": session_id,
+                "container_id": clean_container_id,
+                "runtime_name": runtime_name,
+            },
+        )
+
+
+def _coerce_logs_tail(value: Any, default_value: int = 200) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default_value
+    return max(1, min(number, 2000))
+
+
+@sock.route("/ws/nodes/<node_id>/containers/<container_id>/logs")
+def ws_container_logs(ws, node_id: str, container_id: str):
+    clean_node_id = (node_id or "").strip()
+    clean_container_id = (container_id or "").strip()
+    if not clean_node_id:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if not clean_container_id:
+        ws.send(json.dumps({"type": "terminal_error", "error": "container_not_found"}))
+        return
+
+    node = get_node_by_id(DB_PATH, clean_node_id)
+    if not node:
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if node.get("state") != "paired":
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_paired"}))
+        return
+
+    container_status, container = get_node_container(
+        DB_PATH,
+        node_id=clean_node_id,
+        container_id=clean_container_id,
+    )
+    if container_status == "not_found":
+        ws.send(json.dumps({"type": "terminal_error", "error": "node_not_found"}))
+        return
+    if container_status == "container_not_found" or not isinstance(container, dict):
+        ws.send(json.dumps({"type": "terminal_error", "error": "container_not_found"}))
+        return
+
+    runtime_name = str(container.get("runtime_name") or "").strip()
+    if not runtime_name:
+        ws.send(json.dumps({"type": "terminal_error", "error": "container_runtime_missing"}))
+        return
+
+    query_string = ""
+    environ = getattr(ws, "environ", None)
+    if isinstance(environ, dict):
+        query_string = str(environ.get("QUERY_STRING", ""))
+    query = parse_qs(query_string)
+    tail = _coerce_logs_tail((query.get("tail") or [200])[0], default_value=200)
+
+    session_id, inbound_queue = _register_terminal_session(
+        clean_node_id,
+        container_id=clean_container_id,
+        terminal_kind="container_logs",
+    )
+    _enqueue_agent_ws_message(
+        clean_node_id,
+        {
+            "type": "container_logs_open",
+            "session_id": session_id,
+            "container_id": clean_container_id,
+            "runtime_name": runtime_name,
+            "tail": tail,
+        },
+    )
+    if not _is_agent_connected(clean_node_id):
+        try:
+            inbound_queue.put_nowait(
+                {
+                    "type": "terminal_data",
+                    "session_id": session_id,
+                    "data": "\r\n[waiting for agent websocket connection...]\r\n",
+                }
+            )
+        except queue.Full:
+            pass
+
+    append_node_log(
+        DB_PATH,
+        node_id=clean_node_id,
+        level="info",
+        message="Container logs stream opened",
+        meta={
+            "session_id": session_id,
+            "container_id": clean_container_id,
+            "runtime_name": runtime_name,
+            "tail": tail,
+        },
+    )
+
+    ws.send(json.dumps({"type": "terminal_ready", "session_id": session_id}))
+
+    try:
+        while True:
+            while True:
+                try:
+                    outbound = inbound_queue.get_nowait()
+                except queue.Empty:
+                    break
+                ws.send(json.dumps(outbound))
+
+            try:
+                raw = ws.receive(timeout=0.2)
+            except Exception as exc:
+                if _is_ws_receive_timeout(exc):
+                    continue
+                raise
+            if raw is None:
+                continue
+
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_json"}))
+                continue
+
+            if not isinstance(payload, dict):
+                ws.send(json.dumps({"type": "terminal_error", "error": "invalid_payload"}))
+                continue
+
+            message_type = payload.get("type")
+            if message_type == "ping":
+                ws.send(json.dumps({"type": "pong"}))
+                continue
+
+            if message_type == "close":
+                break
+    except Exception as exc:
+        log.info(
+            f"Container logs websocket closed node_id={clean_node_id} container_id={clean_container_id} "
+            f"session_id={session_id} details={exc}"
+        )
+    finally:
+        _unregister_terminal_session(session_id)
+        _enqueue_agent_ws_message(
+            clean_node_id,
+            {
+                "type": "container_logs_close",
+                "session_id": session_id,
+                "container_id": clean_container_id,
+            },
+        )
+        append_node_log(
+            DB_PATH,
+            node_id=clean_node_id,
+            level="info",
+            message="Container logs stream closed",
+            meta={
+                "session_id": session_id,
+                "container_id": clean_container_id,
+                "runtime_name": runtime_name,
+            },
         )
 
 

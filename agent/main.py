@@ -31,6 +31,11 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from agent.config import AgentConfig, load_config
+from agent.container_docker import (
+    auto_install_container_prerequisites,
+    execute_container_command,
+    get_container_capability,
+)
 from agent.heartbeat import HeartbeatSender
 from agent.vm_libvirt import auto_install_vm_prerequisites, execute_vm_command, get_vm_capability
 from agent.ws_stream import AgentWebSocketStreamer
@@ -162,6 +167,7 @@ def build_heartbeat_extra() -> dict[str, Any]:
         "hardware": info["hardware"],
         "usage": get_runtime_metrics(),
         "vm": get_vm_capability(max_age_seconds=60),
+        "container": get_container_capability(max_age_seconds=60),
     }
     git_commit = get_git_commit_hash()
     if git_commit:
@@ -479,6 +485,7 @@ class TerminalSessionManager:
         self._lock = threading.Lock()
         self._sessions: dict[str, dict[str, Any]] = {}
         self._vm_domain_to_session: dict[str, str] = {}
+        self._container_runtime_to_session: dict[str, str] = {}
 
     @staticmethod
     def _clamp(value: Any, default_value: int, min_value: int, max_value: int) -> int:
@@ -535,6 +542,12 @@ class TerminalSessionManager:
             return command
         return ["sudo", "-n", *command]
 
+    def _docker_command(self, *args: str) -> list[str]:
+        command = ["docker", *args]
+        if self._is_running_as_root():
+            return command
+        return ["sudo", "-n", *command]
+
     def _open_process_session(
         self,
         *,
@@ -548,6 +561,7 @@ class TerminalSessionManager:
         error_prefix: str,
         raw_tty: bool = False,
         vm_domain_name: str | None = None,
+        container_runtime_name: str | None = None,
     ) -> None:
         clean_session_id = (session_id or "").strip()
         if not clean_session_id:
@@ -621,9 +635,12 @@ class TerminalSessionManager:
                 "send_exit": True,
                 "kind": session_kind,
                 "vm_domain_name": vm_domain_name,
+                "container_runtime_name": container_runtime_name,
             }
             if isinstance(vm_domain_name, str) and vm_domain_name.strip():
                 self._vm_domain_to_session[vm_domain_name.strip()] = clean_session_id
+            if isinstance(container_runtime_name, str) and container_runtime_name.strip():
+                self._container_runtime_to_session[container_runtime_name.strip()] = clean_session_id
         reader_thread.start()
         self._logger.info(f"Opened {session_kind} session session_id={clean_session_id}")
 
@@ -702,6 +719,11 @@ class TerminalSessionManager:
                         mapped_session_id = self._vm_domain_to_session.get(vm_domain_name)
                         if mapped_session_id == session_id:
                             self._vm_domain_to_session.pop(vm_domain_name, None)
+                    container_runtime_name = latest.get("container_runtime_name")
+                    if isinstance(container_runtime_name, str) and container_runtime_name.strip():
+                        mapped_container_session_id = self._container_runtime_to_session.get(container_runtime_name)
+                        if mapped_container_session_id == session_id:
+                            self._container_runtime_to_session.pop(container_runtime_name, None)
             if latest:
                 send_exit = bool(latest.get("send_exit", True))
 
@@ -809,6 +831,133 @@ class TerminalSessionManager:
             vm_domain_name=clean_domain_name,
         )
 
+    def open_container_terminal_session(
+        self,
+        session_id: str,
+        runtime_name: Any,
+        cols: Any,
+        rows: Any,
+    ) -> None:
+        clean_session_id = (session_id or "").strip()
+        clean_runtime_name = str(runtime_name or "").strip()
+        if not clean_session_id:
+            return
+        if not clean_runtime_name:
+            self._send_error(clean_session_id, "runtime_name is required")
+            return
+
+        if shutil.which("docker") is None:
+            self._send_error(clean_session_id, "docker is not installed on this node")
+            return
+        if not self._is_running_as_root() and shutil.which("sudo") is None:
+            self._send_error(clean_session_id, "sudo is required to access docker")
+            return
+
+        with self._lock:
+            existing_session_id = self._container_runtime_to_session.get(clean_runtime_name)
+        if (
+            isinstance(existing_session_id, str)
+            and existing_session_id
+            and existing_session_id != clean_session_id
+        ):
+            self._logger.info(
+                "Replacing existing container terminal session "
+                f"runtime={clean_runtime_name} old_session={existing_session_id} "
+                f"new_session={clean_session_id}"
+            )
+            self.close_session(existing_session_id, send_exit=False)
+
+        state_command = self._docker_command("inspect", "-f", "{{.State.Status}}", clean_runtime_name)
+        try:
+            state_result = subprocess.run(
+                state_command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+        except Exception as exc:
+            self._send_error(clean_session_id, f"Unable to check container state: {exc}")
+            return
+
+        if state_result.returncode != 0:
+            details = (state_result.stderr or state_result.stdout or "").strip()
+            lower_details = details.lower()
+            if "no such container" in lower_details:
+                self._send_error(clean_session_id, f"Container not found: {clean_runtime_name}")
+            else:
+                self._send_error(clean_session_id, f"Unable to access container terminal: {details or 'unknown error'}")
+            return
+
+        state_text = (state_result.stdout or "").strip().lower()
+        if state_text != "running":
+            self._send_error(clean_session_id, "Container is not running. Start the container and reconnect.")
+            return
+
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+        self._open_process_session(
+            session_id=clean_session_id,
+            cols=cols,
+            rows=rows,
+            command=self._docker_command(
+                "exec",
+                "-it",
+                clean_runtime_name,
+                "/bin/sh",
+                "-lc",
+                "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi",
+            ),
+            cwd=str(ROOT_DIR),
+            env=env,
+            session_kind="container_terminal",
+            error_prefix="Unable to open container terminal",
+            raw_tty=True,
+            container_runtime_name=clean_runtime_name,
+        )
+
+    def open_container_logs_session(
+        self,
+        session_id: str,
+        runtime_name: Any,
+        tail: Any,
+    ) -> None:
+        clean_session_id = (session_id or "").strip()
+        clean_runtime_name = str(runtime_name or "").strip()
+        if not clean_session_id:
+            return
+        if not clean_runtime_name:
+            self._send_error(clean_session_id, "runtime_name is required")
+            return
+
+        if shutil.which("docker") is None:
+            self._send_error(clean_session_id, "docker is not installed on this node")
+            return
+        if not self._is_running_as_root() and shutil.which("sudo") is None:
+            self._send_error(clean_session_id, "sudo is required to access docker")
+            return
+
+        tail_count = self._clamp(tail, default_value=200, min_value=1, max_value=2000)
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+        self._open_process_session(
+            session_id=clean_session_id,
+            cols=120,
+            rows=40,
+            command=self._docker_command(
+                "logs",
+                "--tail",
+                str(tail_count),
+                "-f",
+                clean_runtime_name,
+            ),
+            cwd=str(ROOT_DIR),
+            env=env,
+            session_kind="container_logs",
+            error_prefix="Unable to open container logs stream",
+            raw_tty=False,
+        )
+
     def write_input(self, session_id: str, data: Any) -> None:
         clean_session_id = (session_id or "").strip()
         if not clean_session_id:
@@ -819,6 +968,8 @@ class TerminalSessionManager:
             session = self._sessions.get(clean_session_id)
         if not session:
             self._send_error(clean_session_id, "terminal session not found")
+            return
+        if session.get("kind") == "container_logs":
             return
         master_fd = int(session["master_fd"])
         try:
@@ -923,7 +1074,41 @@ def main() -> None:
                 message = f"{message} detail={hint}"
             log.info(message)
 
+    def bootstrap_container_prerequisites() -> None:
+        result = auto_install_container_prerequisites(force=False)
+        details = result.get("details")
+        hint = None
+        if isinstance(details, dict):
+            stderr = str(details.get("stderr", "")).strip()
+            stdout = str(details.get("stdout", "")).strip()
+            for source in (stderr, stdout):
+                if not source:
+                    continue
+                for raw_line in source.splitlines():
+                    line = raw_line.strip()
+                    if line:
+                        hint = line
+                        break
+                if hint:
+                    break
+
+        if result.get("attempted"):
+            ready = bool(result.get("ready"))
+            message = (
+                f"Container prerequisite auto-install attempted ready={ready} "
+                f"manager={result.get('package_manager')} message={result.get('message')}"
+            )
+            if hint:
+                message = f"{message} detail={hint}"
+            log.info(message)
+        else:
+            message = f"Container prerequisite auto-install skipped message={result.get('message')}"
+            if hint:
+                message = f"{message} detail={hint}"
+            log.info(message)
+
     threading.Thread(target=bootstrap_vm_prerequisites, daemon=True).start()
+    threading.Thread(target=bootstrap_container_prerequisites, daemon=True).start()
 
     state = load_state(STATE_PATH)
     if state and state.get("node_id") and state.get("pair_token"):
@@ -937,6 +1122,7 @@ def main() -> None:
     terminal_manager = TerminalSessionManager(lambda: ws_streamer, log)
     update_in_progress = threading.Event()
     vm_command_in_progress = threading.Event()
+    container_command_in_progress = threading.Event()
     terminal_command_in_progress = threading.Event()
 
     def execute_command(
@@ -955,6 +1141,12 @@ def main() -> None:
         )
         vm_id_raw = command.get("vm_id")
         vm_id = vm_id_raw.strip() if isinstance(vm_id_raw, str) and vm_id_raw.strip() else None
+        container_id_raw = command.get("container_id")
+        container_id = (
+            container_id_raw.strip()
+            if isinstance(container_id_raw, str) and container_id_raw.strip()
+            else None
+        )
         command_id = command.get("command_id")
         if not isinstance(command_id, str) or not command_id.strip():
             command_id = "unknown"
@@ -1021,6 +1213,32 @@ def main() -> None:
                 send_result(status=status, message=message, details=details)
             finally:
                 vm_command_in_progress.clear()
+            return
+
+        if isinstance(command_type, str) and command_type.startswith("container_"):
+            if container_command_in_progress.is_set():
+                message = "Another container command is already in progress"
+                log.info(f"{message} command_id={command_id}")
+                send_result(status="busy", message=message)
+                return
+
+            container_command_in_progress.set()
+            try:
+                log.info(
+                    f"Received container command command_id={command_id} "
+                    f"type={command_type} container_id={container_id}"
+                )
+                send_result(status="running", message=f"{command_type} started")
+
+                status, message, details = execute_container_command(command)
+                level = "error" if status != "succeeded" else "info"
+                log.log(
+                    logging.ERROR if level == "error" else logging.INFO,
+                    f"Container command {command_type} -> {status}: {message}",
+                )
+                send_result(status=status, message=message, details=details)
+            finally:
+                container_command_in_progress.clear()
             return
 
         if command_type == "terminal_exec":
@@ -1100,11 +1318,28 @@ def main() -> None:
             )
             return
 
-        if event_type in {"terminal_input", "vm_terminal_input"}:
+        if event_type == "container_terminal_open":
+            terminal_manager.open_container_terminal_session(
+                session_id=session_id,
+                runtime_name=event.get("runtime_name"),
+                cols=event.get("cols"),
+                rows=event.get("rows"),
+            )
+            return
+
+        if event_type == "container_logs_open":
+            terminal_manager.open_container_logs_session(
+                session_id=session_id,
+                runtime_name=event.get("runtime_name"),
+                tail=event.get("tail"),
+            )
+            return
+
+        if event_type in {"terminal_input", "vm_terminal_input", "container_terminal_input"}:
             terminal_manager.write_input(session_id=session_id, data=event.get("data"))
             return
 
-        if event_type in {"terminal_resize", "vm_terminal_resize"}:
+        if event_type in {"terminal_resize", "vm_terminal_resize", "container_terminal_resize"}:
             terminal_manager.resize_session(
                 session_id=session_id,
                 cols=event.get("cols"),
@@ -1112,7 +1347,7 @@ def main() -> None:
             )
             return
 
-        if event_type in {"terminal_close", "vm_terminal_close"}:
+        if event_type in {"terminal_close", "vm_terminal_close", "container_terminal_close", "container_logs_close"}:
             terminal_manager.close_session(session_id=session_id, send_exit=False)
             return
 

@@ -388,6 +388,12 @@ class AgentWebSocketStreamer:
                                     "vm_terminal_input",
                                     "vm_terminal_resize",
                                     "vm_terminal_close",
+                                    "container_terminal_open",
+                                    "container_terminal_input",
+                                    "container_terminal_resize",
+                                    "container_terminal_close",
+                                    "container_logs_open",
+                                    "container_logs_close",
                                 }
                                 and self.terminal_handler
                             ):
