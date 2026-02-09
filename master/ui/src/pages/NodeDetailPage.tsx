@@ -12,6 +12,7 @@ import {
 import { faApple, faLinux, faWindows } from "@fortawesome/free-brands-svg-icons";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import NodeContainersPanel from "../components/NodeContainersPanel";
+import NodeMarketplacePanel from "../components/NodeMarketplacePanel";
 import NodeVmsPanel from "../components/NodeVmsPanel";
 import NodeTerminalPanel from "../components/NodeTerminalPanel";
 import { NodeLogRecord, NodeRecord, RuntimeMetrics } from "../types";
@@ -205,7 +206,7 @@ export default function NodeDetailPage({
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"main" | "stats" | "vms" | "containers" | "terminal">("main");
+  const [activeTab, setActiveTab] = useState<"main" | "stats" | "vms" | "containers" | "marketplace" | "terminal">("main");
   const [openCreateVmIntent, setOpenCreateVmIntent] = useState(0);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -238,6 +239,7 @@ export default function NodeDetailPage({
       initialTab === "stats" ||
       initialTab === "vms" ||
       initialTab === "containers" ||
+      initialTab === "marketplace" ||
       initialTab === "terminal"
     ) {
       setActiveTab(initialTab);
@@ -673,6 +675,15 @@ export default function NodeDetailPage({
         <button
           type="button"
           role="tab"
+          aria-selected={activeTab === "marketplace"}
+          className={`node-tab ${activeTab === "marketplace" ? "node-tab-active" : ""}`}
+          onClick={() => setActiveTab("marketplace")}
+        >
+          Marketplace
+        </button>
+        <button
+          type="button"
+          role="tab"
           aria-selected={activeTab === "terminal"}
           className={`node-tab ${activeTab === "terminal" ? "node-tab-active" : ""}`}
           onClick={() => setActiveTab("terminal")}
@@ -800,6 +811,10 @@ export default function NodeDetailPage({
 
       {activeTab === "containers" ? (
         <NodeContainersPanel node={node} apiBaseUrl={apiBaseUrl} />
+      ) : null}
+
+      {activeTab === "marketplace" ? (
+        <NodeMarketplacePanel node={node} apiBaseUrl={apiBaseUrl} />
       ) : null}
 
       {activeTab === "terminal" ? (

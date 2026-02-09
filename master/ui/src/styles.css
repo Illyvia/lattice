@@ -1192,6 +1192,51 @@ th {
   gap: 12px;
 }
 
+.marketplace-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.marketplace-card {
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  box-shadow: var(--shadow-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.marketplace-card-title h4 {
+  margin: 0;
+}
+
+.marketplace-description {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.marketplace-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.marketplace-meta-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.marketplace-install-button {
+  margin-bottom: 0;
+  align-self: flex-start;
+}
+
 .vm-panel-header {
   display: flex;
   align-items: center;
